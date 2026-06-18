@@ -1,0 +1,12 @@
+data/
+checkpoints/
+runs/
+logs/
+__pycache__/
+.idea/
+
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.log
