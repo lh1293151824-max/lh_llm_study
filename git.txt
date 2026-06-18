@@ -1,0 +1,35 @@
+# 1. 删除旧的 Git 记录，只删除 .git，不删除代码
+Remove-Item -Recurse -Force .git
+
+# 2. 重新初始化 Git 仓库
+git init
+
+# 3. 设置分支为 main
+git branch -M main
+
+# 4. 查看当前状态
+git status
+
+# 5. 添加所有文件
+git add .
+
+# 6. 再看一次，确认文件都进入暂存区
+git status
+
+# 7. 提交全部代码
+git commit -m first commit
+
+# 8. 提交后再检查，确认没有未提交文件
+git status
+
+# 9. 添加远程仓库
+git remote add origin httpsgithub.comlh1293151824-maxlh_llm_study.git
+
+# 10. 检查远程仓库地址
+git remote -v
+
+# 11. 推送到 GitHub
+git push -u origin main --force
+
+# 12. 最后确认状态
+git status

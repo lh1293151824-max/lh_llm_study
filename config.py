@@ -1,6 +1,6 @@
 # config.py
 
-# Switch between quick local smoke tests and happy-llm style pretraining1111111111.
+# Switch between quick local smoke tests and happy-llm style pretraining123.
 # Options: "test", "train"
 CONFIG_MODE = "test"
 
