@@ -33,3 +33,11 @@ git push -u origin main --force
 
 # 12. 最后确认状态
 git status
+
+
+#查看状态
+git status
+#全部：add . 部分直接就是文件名
+git add 文件名
+git commit -m "随便写个说明"
+git push
