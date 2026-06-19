@@ -1,4 +1,4 @@
-# 1. 删除旧的 Git 记录，只删除 .git，不删除代码
+# 1. 删除旧的 Git 记录，只删除 .git，不删除代码，我只是测试一下哦
 Remove-Item -Recurse -Force .git
 
 # 2. 重新初始化 Git 仓库
