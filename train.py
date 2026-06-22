@@ -1,12 +1,14 @@
 import datetime
 import math
 import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import random
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast, GradScaler
+
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -15,6 +17,8 @@ from transformers import AutoTokenizer
 import config as default_config
 from dataset import PretrainDataset
 from k_model import ModelConfig, Transformer
+
+
 
 
 def build_args_from_config():
@@ -60,7 +64,7 @@ def build_args_from_config():
 def log_message(message, log_file=None):
     message = str(message)
     safe_message = message.encode("gbk", errors="replace").decode("gbk")
-    print(safe_message, flush=True)
+    # print(safe_message, flush=True)
     if log_file is not None:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(message + "\n")
@@ -263,7 +267,7 @@ def train(args):
     log_message(f"trainable_params: {trainable_params / 1e9:.6f} B", log_file)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    scaler = GradScaler(enabled=args.use_amp and device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=args.use_amp and device.type == "cuda")
 
     start_epoch = 0
     global_step = 0
@@ -281,14 +285,14 @@ def train(args):
     model.train()
     total_steps = args.epochs * len(loader)
     avg_loss = 0.0
-    progress = tqdm(range(start_epoch, args.epochs))
 
-    for epoch in progress:
+    for epoch in range(start_epoch, args.epochs):
         total_loss = 0.0
         current_epoch = epoch + 1
         optimizer.zero_grad(set_to_none=True)
+        pbar = tqdm(loader, desc=f"epoch={current_epoch}/{args.epochs}")
 
-        for step, (x, labels, loss_mask, attention_mask) in enumerate(loader):
+        for step, (x, labels, loss_mask, attention_mask) in enumerate(pbar):
             x = x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             loss_mask = loss_mask.to(device, non_blocking=True)
@@ -298,7 +302,7 @@ def train(args):
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
-            with autocast(enabled=args.use_amp and device.type == "cuda"):
+            with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 _, loss = model(x, labels, attention_mask=attention_mask)
                 loss_mask = loss_mask.view(-1)
                 loss = torch.sum(loss * loss_mask) / loss_mask.sum()
@@ -320,6 +324,11 @@ def train(args):
             writer.add_scalar("train/batch_loss", loss.item(), global_step)
             writer.add_scalar("train/lr", lr, global_step)
             global_step += 1
+            pbar.set_postfix(
+                step=global_step,
+                loss=f"{loss.item():.6f}",
+                lr=f"{lr:.8f}",
+            )
 
             if args.log_interval > 0 and global_step % args.log_interval == 0:
                 message = (
@@ -328,18 +337,17 @@ def train(args):
                     f"loss={loss.item():.6f} | "
                     f"lr={lr:.8f}"
                 )
-                progress.set_description(message)
                 log_message(message, log_file)
 
-            if args.generate_every_steps > 0 and global_step % args.generate_every_steps == 0:
-                sample_text = generate_during_training(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt=args.generate_prompt,
-                    args=args,
-                    device=device,
-                )
-                log_message(f"sample step={global_step}: {sample_text}", log_file)
+            # if args.generate_every_steps > 0 and global_step % args.generate_every_steps == 0:
+            #     sample_text = generate_during_training(
+            #         model=model,
+            #         tokenizer=tokenizer,
+            #         prompt=args.generate_prompt,
+            #         args=args,
+            #         device=device,
+            #     )
+            #     log_message(f"sample step={global_step}: {sample_text}", log_file)
 
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 step_save_path = os.path.join(
@@ -362,7 +370,7 @@ def train(args):
         avg_loss = total_loss / len(loader)
         writer.add_scalar("train/epoch_avg_loss", avg_loss, current_epoch)
         epoch_message = f"epoch={current_epoch}/{args.epochs} | avg_loss={avg_loss:.6f}"
-        progress.set_description(epoch_message)
+        # progress.set_description(epoch_message)
         log_message(epoch_message, log_file)
 
         if current_epoch % args.save_every_epochs == 0:
@@ -403,4 +411,5 @@ def train(args):
 
 
 if __name__ == "__main__":
+    
     train(build_args_from_config())
