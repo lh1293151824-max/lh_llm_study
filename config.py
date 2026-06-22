@@ -66,7 +66,7 @@ TEST_CONFIG = {
     # Standalone generate.py defaults
     "MAX_NEW_TOKENS": 64,
     "TEMPERATURE": 0.9,
-    "TOP_K": 3,
+    "TOP_K": 1,
     "STREAM": True,
 }
 
@@ -115,7 +115,7 @@ TRAIN_CONFIG = {
     # Standalone generate.py defaults
     "MAX_NEW_TOKENS": 512,
     "TEMPERATURE": 0.9,
-    "TOP_K": 3,
+    "TOP_K": 1,
     "STREAM": True,
 }
 

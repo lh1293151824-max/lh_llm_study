@@ -84,9 +84,12 @@ def generate_text_stream(
     top_k=None,
     delay=0.0,
 ):
+
     model.eval()
     eos_token_id = tokenizer.eos_token_id
+    prompt = f"{tokenizer.bos_token}{prompt}"
     x = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    
     temperature = max(temperature, 1e-5)
 
     with torch.no_grad():
@@ -152,7 +155,6 @@ def generate_text(
         ):
             print(chunk, end="", flush=True)
             full_text += chunk
-        print()
         return full_text.strip()
 
     for chunk in generate_text_stream(
@@ -173,6 +175,9 @@ def generate_text(
 def main():
     model, tokenizer, checkpoint, device = load_model()
 
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model has {num_params / 1e6:.3f} M parameters.")
+
     print(
         "\nPretrain model loaded. Enter text to continue generation; "
         "enter exit or quit to stop.\n"
@@ -188,7 +193,6 @@ def main():
         if prompt == "":
             print("Input cannot be empty. Please try again.")
             continue
-
         answer = generate_text(
             model=model,
             tokenizer=tokenizer,
