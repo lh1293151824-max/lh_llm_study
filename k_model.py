@@ -355,10 +355,12 @@ class Transformer(PreTrainedModel):
             x = layer(x, freqs_cos, freqs_sin, attention_mask=attention_mask)
 
         x = self.norm(x)
-        logits = self.output(x)
 
         if targets is None:
+            logits = self.output(x[:, [-1], :])
             return logits
+
+        logits = self.output(x)
 
         batch_size, seq_len, vocab_size = logits.shape
         loss = F.cross_entropy(
