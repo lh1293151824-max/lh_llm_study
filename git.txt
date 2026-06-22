@@ -41,3 +41,15 @@ git status
 git add 文件名
 git commit -m "随便写个说明"
 git push
+
+
+
+#先获取最新代码，再修改代码，再推送
+git status
+git pull --rebase origin main
+# 修改代码
+git status
+git add .
+git commit -m "说明本次修改"
+git pull --rebase origin main
+git push
