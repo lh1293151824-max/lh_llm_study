@@ -2,14 +2,14 @@
 
 # Switch between quick local smoke tests and happy-llm style pretraining192819.
 # Options: "test", "train"
-CONFIG_MODE = "test"
+CONFIG_MODE = "train"
 
 
 # =============================================================================
 # Common paths
 # =============================================================================
 
-TOKENIZER_NAME = "./tokenizer_k"
+TOKENIZER_NAME = "tokenizer_k"
 TRAIN_TEXT_PATH = "data/seq_monkey_datawhale.jsonl"
 
 LOG_DIR = "runs"
@@ -102,7 +102,7 @@ TRAIN_CONFIG = {
 
     # Logging and checkpoints
     "LOG_INTERVAL": 100,
-    "SAVE_EVERY_STEPS": 1000,
+    "SAVE_EVERY_STEPS": 5000,
     "SAVE_EVERY_EPOCHS": 1,
 
     # Generation during training
