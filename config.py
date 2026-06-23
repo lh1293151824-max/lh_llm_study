@@ -1,38 +1,72 @@
 # config.py
 
-# Switch between quick local smoke tests and happy-llm style pretraining192819.
 # Options: "test", "train"
-CONFIG_MODE = "train"
+CONFIG_MODE = "test"
+
+# Options: "pretrain", "sft"
+TRAIN_STAGE = "sft"
 
 
 # =============================================================================
-# Common paths
+# Common paths and switches
 # =============================================================================
 
 TOKENIZER_NAME = "tokenizer_k"
-TRAIN_TEXT_PATH = "data/seq_monkey_datawhale.jsonl"
+PRETRAIN_DATA_PATH = "data/seq_monkey_datawhale.jsonl"
+SFT_DATA_PATH = "data/sft_train_3.5M_CN.json"
 
 LOG_DIR = "runs"
 TEXT_LOG_DIR = "logs"
 CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_PREFIX = "transformer"
-CHECKPOINT_PATH = "transformer_final.pt"
 
 RESUME = False
 RESUME_CHECKPOINT_PATH = ""
 
+# Used by the formal SFT config when TRAIN_STAGE == "sft" and RESUME == False.
+DEFAULT_SFT_INIT_CHECKPOINT_PATH = "checkpoints/transformer_final.pt"
+
+SYSTEM_PROMPT = "你是一个AI助手"
+
 
 # =============================================================================
-# Test config: small CPU-friendly run for checking that the code path works.
+# Shared model defaults: aligned with the happy-llm chapter 5 215M-style model.
 # =============================================================================
 
-TEST_CONFIG = {
+MODEL_215M_CONFIG = {
+    "DIM_EMBEDDING": 1024,
+    "N_HEADS": 16,
+    "N_LAYERS": 18,
+    "N_KV_HEADS": 8,
+    "NORM_EPS": 1e-5,
+    "DROPOUT": 0.0,
+    "FLASH_ATTN": False,
+    "MULTIPLE_OF": 64,
+}
+
+MODEL_TEST_CONFIG = {
+    "DIM_EMBEDDING": 128,
+    "N_HEADS": 4,
+    "N_LAYERS": 2,
+    "N_KV_HEADS": 2,
+    "NORM_EPS": 1e-5,
+    "DROPOUT": 0.0,
+    "FLASH_ATTN": False,
+    "MULTIPLE_OF": 64,
+}
+
+
+# =============================================================================
+# Pretrain configs
+# =============================================================================
+
+PRETRAIN_TEST_CONFIG = {
     # Runtime
     "SEED": 42,
     "NUM_WORKERS": 4,
     "USE_AMP": False,
 
     # Data and training
+    "DATA_PATH": PRETRAIN_DATA_PATH,
     "BATCH_SIZE": 1,
     "SEQ_LEN": 64,
     "EPOCHS": 1,
@@ -42,23 +76,18 @@ TEST_CONFIG = {
     "GRAD_CLIP": 1.0,
 
     # Model
-    "DIM_EMBEDDING": 128,
-    "N_HEADS": 4,
-    "N_LAYERS": 2,
-    "N_KV_HEADS": 2,
-    "NORM_EPS": 1e-5,
-    "DROPOUT": 0.0,
-    "FLASH_ATTN": False,
-    "MULTIPLE_OF": 64,
+    **MODEL_TEST_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_PREFIX": "transformer_pretrain_test",
+    "CHECKPOINT_PATH": "transformer_pretrain_test_final.pt",
     "LOG_INTERVAL": 5,
     "SAVE_EVERY_STEPS": 20,
     "SAVE_EVERY_EPOCHS": 1,
 
     # Generation during training
     "GENERATE_EVERY_STEPS": 10,
-    "GENERATE_PROMPT": "\u4eba\u5de5\u667a\u80fd",
+    "GENERATE_PROMPT": "人工智能",
     "GENERATE_MAX_NEW_TOKENS": 20,
     "GENERATE_TEMPERATURE": 0.9,
     "GENERATE_TOP_K": 5,
@@ -66,22 +95,18 @@ TEST_CONFIG = {
     # Standalone generate.py defaults
     "MAX_NEW_TOKENS": 64,
     "TEMPERATURE": 0.9,
-    "TOP_K": 1,
+    "TOP_K": 3,
     "STREAM": True,
 }
 
-
-# =============================================================================
-# Train config: aligned with happy-llm chapter 5 pretraining defaults.
-# =============================================================================
-
-TRAIN_CONFIG = {
+PRETRAIN_TRAIN_CONFIG = {
     # Runtime
     "SEED": 42,
     "NUM_WORKERS": 4,
     "USE_AMP": True,
 
     # Data and training
+    "DATA_PATH": PRETRAIN_DATA_PATH,
     "BATCH_SIZE": 12,
     "SEQ_LEN": 512,
     "EPOCHS": 2,
@@ -91,23 +116,18 @@ TRAIN_CONFIG = {
     "GRAD_CLIP": 1.0,
 
     # Model
-    "DIM_EMBEDDING": 1024,
-    "N_HEADS": 16,
-    "N_LAYERS": 18,
-    "N_KV_HEADS": 8,
-    "NORM_EPS": 1e-5,
-    "DROPOUT": 0.0,
-    "FLASH_ATTN": False,
-    "MULTIPLE_OF": 64,
+    **MODEL_215M_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_PREFIX": "transformer_pretrain",
+    "CHECKPOINT_PATH": "transformer_final.pt",
     "LOG_INTERVAL": 100,
     "SAVE_EVERY_STEPS": 5000,
     "SAVE_EVERY_EPOCHS": 1,
 
     # Generation during training
     "GENERATE_EVERY_STEPS": 500,
-    "GENERATE_PROMPT": "\u4eba\u5de5\u667a\u80fd",
+    "GENERATE_PROMPT": "人工智能",
     "GENERATE_MAX_NEW_TOKENS": 80,
     "GENERATE_TEMPERATURE": 0.9,
     "GENERATE_TOP_K": 5,
@@ -115,7 +135,94 @@ TRAIN_CONFIG = {
     # Standalone generate.py defaults
     "MAX_NEW_TOKENS": 512,
     "TEMPERATURE": 0.9,
-    "TOP_K": 1,
+    "TOP_K": 3,
+    "STREAM": True,
+}
+
+
+# =============================================================================
+# SFT configs
+# =============================================================================
+
+SFT_TEST_CONFIG = {
+    # Runtime
+    "SEED": 42,
+    "NUM_WORKERS": 4,
+    "USE_AMP": False,
+
+    # Data and training
+    "DATA_PATH": SFT_DATA_PATH,
+    "SFT_INIT_CHECKPOINT_PATH": "",
+    "BATCH_SIZE": 1,
+    "SEQ_LEN": 64,
+    "EPOCHS": 1,
+    "LEARNING_RATE": 1e-5,
+    "ACCUMULATION_STEPS": 1,
+    "WARMUP_ITERS": 0,
+    "GRAD_CLIP": 1.0,
+
+    # Model
+    **MODEL_TEST_CONFIG,
+
+    # Logging and checkpoints
+    "CHECKPOINT_PREFIX": "transformer_sft_test",
+    "CHECKPOINT_PATH": "transformer_sft_test_final.pt",
+    "LOG_INTERVAL": 5,
+    "SAVE_EVERY_STEPS": 20,
+    "SAVE_EVERY_EPOCHS": 1,
+
+    # Generation during training
+    "GENERATE_EVERY_STEPS": 10,
+    "GENERATE_PROMPT": "请介绍一下人工智能。",
+    "GENERATE_MAX_NEW_TOKENS": 20,
+    "GENERATE_TEMPERATURE": 0.7,
+    "GENERATE_TOP_K": 5,
+
+    # Standalone generate.py defaults
+    "MAX_NEW_TOKENS": 128,
+    "TEMPERATURE": 0.7,
+    "TOP_K": 5,
+    "STREAM": True,
+}
+
+SFT_TRAIN_CONFIG = {
+    # Runtime
+    "SEED": 42,
+    "NUM_WORKERS": 4,
+    "USE_AMP": True,
+
+    # Data and training
+    "DATA_PATH": SFT_DATA_PATH,
+    "SFT_INIT_CHECKPOINT_PATH": DEFAULT_SFT_INIT_CHECKPOINT_PATH,
+    "BATCH_SIZE": 12,
+    "SEQ_LEN": 512,
+    "EPOCHS": 1,
+    "LEARNING_RATE": 1e-5,
+    "ACCUMULATION_STEPS": 8,
+    "WARMUP_ITERS": 0,
+    "GRAD_CLIP": 1.0,
+
+    # Model
+    **MODEL_215M_CONFIG,
+
+    # Logging and checkpoints
+    "CHECKPOINT_PREFIX": "transformer_sft",
+    "CHECKPOINT_PATH": "transformer_sft_final.pt",
+    "LOG_INTERVAL": 100,
+    "SAVE_EVERY_STEPS": 5000,
+    "SAVE_EVERY_EPOCHS": 1,
+
+    # Generation during training
+    "GENERATE_EVERY_STEPS": 500,
+    "GENERATE_PROMPT": "请介绍一下人工智能。",
+    "GENERATE_MAX_NEW_TOKENS": 80,
+    "GENERATE_TEMPERATURE": 0.7,
+    "GENERATE_TOP_K": 5,
+
+    # Standalone generate.py defaults
+    "MAX_NEW_TOKENS": 512,
+    "TEMPERATURE": 0.7,
+    "TOP_K": 5,
     "STREAM": True,
 }
 
@@ -124,12 +231,23 @@ TRAIN_CONFIG = {
 # Export active config with the variable names used by train.py and generate.py.
 # =============================================================================
 
-if CONFIG_MODE == "test":
-    ACTIVE_CONFIG = TEST_CONFIG
-elif CONFIG_MODE == "train":
-    ACTIVE_CONFIG = TRAIN_CONFIG
-else:
-    raise ValueError('CONFIG_MODE must be "test" or "train"')
+CONFIG_TABLE = {
+    ("pretrain", "test"): PRETRAIN_TEST_CONFIG,
+    ("pretrain", "train"): PRETRAIN_TRAIN_CONFIG,
+    ("sft", "test"): SFT_TEST_CONFIG,
+    ("sft", "train"): SFT_TRAIN_CONFIG,
+}
+
+try:
+    ACTIVE_CONFIG = CONFIG_TABLE[(TRAIN_STAGE, CONFIG_MODE)]
+except KeyError as exc:
+    raise ValueError(
+        'TRAIN_STAGE must be "pretrain" or "sft", and CONFIG_MODE must be "test" or "train"'
+    ) from exc
+
+DATA_PATH = ACTIVE_CONFIG["DATA_PATH"]
+TRAIN_TEXT_PATH = DATA_PATH
+SFT_INIT_CHECKPOINT_PATH = ACTIVE_CONFIG.get("SFT_INIT_CHECKPOINT_PATH", "")
 
 SEED = ACTIVE_CONFIG["SEED"]
 NUM_WORKERS = ACTIVE_CONFIG["NUM_WORKERS"]
@@ -152,6 +270,8 @@ DROPOUT = ACTIVE_CONFIG["DROPOUT"]
 FLASH_ATTN = ACTIVE_CONFIG["FLASH_ATTN"]
 MULTIPLE_OF = ACTIVE_CONFIG["MULTIPLE_OF"]
 
+CHECKPOINT_PREFIX = ACTIVE_CONFIG["CHECKPOINT_PREFIX"]
+CHECKPOINT_PATH = ACTIVE_CONFIG["CHECKPOINT_PATH"]
 LOG_INTERVAL = ACTIVE_CONFIG["LOG_INTERVAL"]
 SAVE_EVERY_STEPS = ACTIVE_CONFIG["SAVE_EVERY_STEPS"]
 SAVE_EVERY_EPOCHS = ACTIVE_CONFIG["SAVE_EVERY_EPOCHS"]

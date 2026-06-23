@@ -15,7 +15,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 import config as default_config
-from dataset import PretrainDataset
+from dataset import PretrainDataset, SFTDataset
 from k_model import ModelConfig, Transformer
 
 
@@ -23,7 +23,8 @@ from k_model import ModelConfig, Transformer
 
 def build_args_from_config():
     return SimpleNamespace(
-        data_path=default_config.TRAIN_TEXT_PATH,
+        train_stage=default_config.TRAIN_STAGE,
+        data_path=default_config.DATA_PATH,
         tokenizer_path=default_config.TOKENIZER_NAME,
         seed=default_config.SEED,
         epochs=default_config.EPOCHS,
@@ -58,6 +59,7 @@ def build_args_from_config():
         generate_top_k=default_config.GENERATE_TOP_K,
         resume=default_config.RESUME,
         resume_checkpoint_path=default_config.RESUME_CHECKPOINT_PATH,
+        sft_init_checkpoint_path=default_config.SFT_INIT_CHECKPOINT_PATH,
     )
 
 
@@ -119,6 +121,8 @@ def save_checkpoint(model, optimizer, tokenizer, epoch, avg_loss, save_path, glo
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "global_step": global_step,
+        "train_stage": args.train_stage,
+        "data_path": args.data_path,
         "model_config": {
             "vocab_size": len(tokenizer),
             "max_seq_len": args.seq_len,
@@ -214,6 +218,7 @@ def train(args):
 
     log_message("=" * 80, log_file)
     log_message(f"start_time: {datetime.datetime.now().isoformat(timespec='seconds')}", log_file)
+    log_message(f"train_stage: {args.train_stage}", log_file)
     log_message(f"data_path: {args.data_path}", log_file)
     log_message(f"tokenizer_path: {args.tokenizer_path}", log_file)
     log_message(f"checkpoint_dir: {args.checkpoint_dir}", log_file)
@@ -229,11 +234,20 @@ def train(args):
     if not os.path.exists(args.data_path):
         raise FileNotFoundError(f"training data not found: {args.data_path}")
 
-    dataset = PretrainDataset(
-        data_path=args.data_path,
-        tokenizer=tokenizer,
-        max_length=args.seq_len + 1,
-    )
+    if args.train_stage == "pretrain":
+        dataset = PretrainDataset(
+            data_path=args.data_path,
+            tokenizer=tokenizer,
+            max_length=args.seq_len + 1,
+        )
+    elif args.train_stage == "sft":
+        dataset = SFTDataset(
+            data_path=args.data_path,
+            tokenizer=tokenizer,
+            max_length=args.seq_len + 1,
+        )
+    else:
+        raise ValueError(f"Unknown train_stage: {args.train_stage}")
 
     loader = DataLoader(
         dataset,
@@ -266,6 +280,30 @@ def train(args):
     log_message(f"total_params: {total_params / 1e9:.6f} B", log_file)
     log_message(f"trainable_params: {trainable_params / 1e9:.6f} B", log_file)
 
+    if args.train_stage == "sft" and not args.resume:
+        if args.sft_init_checkpoint_path:
+            if not os.path.exists(args.sft_init_checkpoint_path):
+                raise FileNotFoundError(
+                    f"sft init checkpoint not found: {args.sft_init_checkpoint_path}"
+                )
+            checkpoint = torch.load(
+                args.sft_init_checkpoint_path,
+                map_location=device,
+                weights_only=False,
+            )
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            log_message(f"sft init checkpoint: {args.sft_init_checkpoint_path}", log_file)
+            if missing_keys:
+                log_message(f"sft init missing_keys: {missing_keys}", log_file)
+            if unexpected_keys:
+                log_message(f"sft init unexpected_keys: {unexpected_keys}", log_file)
+        else:
+            log_message(
+                "未设置 SFT 预训练权重文件，当前将随机初始化模型并用 SFT 数据从零训练。",
+                log_file,
+            )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scaler = GradScaler("cuda", enabled=args.use_amp and device.type == "cuda")
 
@@ -281,7 +319,6 @@ def train(args):
             device=device,
             log_file=log_file,
         )
-
     model.train()
     total_steps = args.epochs * len(loader)
     avg_loss = 0.0
@@ -305,7 +342,10 @@ def train(args):
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 _, loss = model(x, labels, attention_mask=attention_mask)
                 loss_mask = loss_mask.view(-1)
-                loss = torch.sum(loss * loss_mask) / loss_mask.sum()
+                valid_tokens = loss_mask.sum()
+                if valid_tokens.item() == 0:
+                    continue
+                loss = torch.sum(loss * loss_mask) / valid_tokens
                 loss_back = loss / args.accumulation_steps
 
             scaler.scale(loss_back).backward()

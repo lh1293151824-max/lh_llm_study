@@ -69,14 +69,11 @@ def load_model(checkpoint_path=None):
     return model, tokenizer, checkpoint, device
 
 
-def build_prompt(text):
-    return text.strip()
-
-
 def generate_text_stream(
     model,
     tokenizer,
     prompt,
+    stage="pretrain",
     seq_len=128,
     max_token=100,
     device="cpu",
@@ -87,7 +84,7 @@ def generate_text_stream(
 
     model.eval()
     eos_token_id = tokenizer.eos_token_id
-    prompt = f"{tokenizer.bos_token}{prompt}"
+    prompt = build_prompt(prompt, tokenizer, stage)
     x = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     
     temperature = max(temperature, 1e-5)
@@ -126,11 +123,24 @@ def generate_text_stream(
             if delay > 0:
                 time.sleep(delay)
 
+def build_prompt(text, tokenizer, stage):
+    if stage == "sft":
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text.strip()},
+        ]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return f"{tokenizer.bos_token}{text.strip()}"
 
 def generate_text(
     model,
     tokenizer,
     prompt,
+    stage="pretrain",
     seq_len=128,
     max_token=100,
     device="cpu",
@@ -146,6 +156,7 @@ def generate_text(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
+            stage=stage,
             seq_len=seq_len,
             max_token=max_token,
             device=device,
@@ -161,6 +172,7 @@ def generate_text(
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
+        stage=stage,
         seq_len=seq_len,
         max_token=max_token,
         device=device,
@@ -174,12 +186,13 @@ def generate_text(
 
 def main():
     model, tokenizer, checkpoint, device = load_model()
+    stage = checkpoint.get("train_stage", TRAIN_STAGE)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {num_params / 1e6:.3f} M parameters.")
 
     print(
-        "\nPretrain model loaded. Enter text to continue generation; "
+        f"\n{stage} model loaded. Enter text to generate; "
         "enter exit or quit to stop.\n"
     )
 
@@ -196,7 +209,8 @@ def main():
         answer = generate_text(
             model=model,
             tokenizer=tokenizer,
-            prompt=build_prompt(prompt),
+            prompt=prompt,
+            stage=stage,
             seq_len=model.max_seq_len,
             max_token=MAX_NEW_TOKENS,
             device=device,
