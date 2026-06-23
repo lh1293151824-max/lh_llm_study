@@ -54,7 +54,7 @@ git commit -m "说明本次修改"
 git pull --rebase origin main
 git push
 
-#改ssh
+#改ssh1111111
 #查看是不是http
 git remote -v
 #更改ssh
