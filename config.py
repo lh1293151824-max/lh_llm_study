@@ -1,10 +1,10 @@
 # config.py
 
 # Options: "test", "train"
-CONFIG_MODE = "test"
+CONFIG_MODE = "train"
 
 # Options: "pretrain", "sft"
-TRAIN_STAGE = "sft"
+TRAIN_STAGE = "pretrain"
 
 
 # =============================================================================
