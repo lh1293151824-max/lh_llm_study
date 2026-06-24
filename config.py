@@ -1,10 +1,10 @@
 # config.py
 
 # Options: "test", "train"
-CONFIG_MODE = "test"
+CONFIG_MODE = "train"
 
 # Options: "pretrain", "sft"
-TRAIN_STAGE = "pretrain"
+TRAIN_STAGE = "sft"
 
 
 # =============================================================================
@@ -17,13 +17,15 @@ SFT_DATA_PATH = "data/sft_train_3.5M_CN.json"
 
 LOG_DIR = "runs"
 TEXT_LOG_DIR = "logs"
-CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_ROOT_DIR = "checkpoints"
+PRETRAIN_CHECKPOINT_DIR = "checkpoints/pretrain"
+SFT_CHECKPOINT_DIR = "checkpoints/sft"
 
 RESUME = False
 RESUME_CHECKPOINT_PATH = ""
 
 # Used by the formal SFT config when TRAIN_STAGE == "sft" and RESUME == False.
-DEFAULT_SFT_INIT_CHECKPOINT_PATH = "checkpoints/transformer_final.pt"
+DEFAULT_SFT_INIT_CHECKPOINT_PATH = "checkpoints/pretrain/transformer_pretrain_final.pt"
 
 SYSTEM_PROMPT = "你是一个AI助手"
 
@@ -62,7 +64,7 @@ MODEL_TEST_CONFIG = {
 PRETRAIN_TEST_CONFIG = {
     # Runtime
     "SEED": 42,
-    "NUM_WORKERS": 4,
+    "NUM_WORKERS": 0,
     "USE_AMP": False,
 
     # Data and training
@@ -79,6 +81,7 @@ PRETRAIN_TEST_CONFIG = {
     **MODEL_TEST_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_DIR": PRETRAIN_CHECKPOINT_DIR,
     "CHECKPOINT_PREFIX": "transformer_pretrain_test",
     "CHECKPOINT_PATH": "transformer_pretrain_test_final.pt",
     "LOG_INTERVAL": 5,
@@ -102,7 +105,7 @@ PRETRAIN_TEST_CONFIG = {
 PRETRAIN_TRAIN_CONFIG = {
     # Runtime
     "SEED": 42,
-    "NUM_WORKERS": 4,
+    "NUM_WORKERS": 0,
     "USE_AMP": True,
 
     # Data and training
@@ -119,8 +122,9 @@ PRETRAIN_TRAIN_CONFIG = {
     **MODEL_215M_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_DIR": PRETRAIN_CHECKPOINT_DIR,
     "CHECKPOINT_PREFIX": "transformer_pretrain",
-    "CHECKPOINT_PATH": "transformer_final.pt",
+    "CHECKPOINT_PATH": "transformer_pretrain_final.pt",
     "LOG_INTERVAL": 100,
     "SAVE_EVERY_STEPS": 5000,
     "SAVE_EVERY_EPOCHS": 1,
@@ -147,7 +151,7 @@ PRETRAIN_TRAIN_CONFIG = {
 SFT_TEST_CONFIG = {
     # Runtime
     "SEED": 42,
-    "NUM_WORKERS": 4,
+    "NUM_WORKERS": 0,
     "USE_AMP": False,
 
     # Data and training
@@ -165,6 +169,7 @@ SFT_TEST_CONFIG = {
     **MODEL_TEST_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_DIR": SFT_CHECKPOINT_DIR,
     "CHECKPOINT_PREFIX": "transformer_sft_test",
     "CHECKPOINT_PATH": "transformer_sft_test_final.pt",
     "LOG_INTERVAL": 5,
@@ -188,7 +193,7 @@ SFT_TEST_CONFIG = {
 SFT_TRAIN_CONFIG = {
     # Runtime
     "SEED": 42,
-    "NUM_WORKERS": 4,
+    "NUM_WORKERS": 0,
     "USE_AMP": True,
 
     # Data and training
@@ -206,10 +211,11 @@ SFT_TRAIN_CONFIG = {
     **MODEL_215M_CONFIG,
 
     # Logging and checkpoints
+    "CHECKPOINT_DIR": SFT_CHECKPOINT_DIR,
     "CHECKPOINT_PREFIX": "transformer_sft",
     "CHECKPOINT_PATH": "transformer_sft_final.pt",
     "LOG_INTERVAL": 100,
-    "SAVE_EVERY_STEPS": 5000,
+    "SAVE_EVERY_STEPS": 10000,
     "SAVE_EVERY_EPOCHS": 1,
 
     # Generation during training
@@ -270,6 +276,7 @@ DROPOUT = ACTIVE_CONFIG["DROPOUT"]
 FLASH_ATTN = ACTIVE_CONFIG["FLASH_ATTN"]
 MULTIPLE_OF = ACTIVE_CONFIG["MULTIPLE_OF"]
 
+CHECKPOINT_DIR = ACTIVE_CONFIG["CHECKPOINT_DIR"]
 CHECKPOINT_PREFIX = ACTIVE_CONFIG["CHECKPOINT_PREFIX"]
 CHECKPOINT_PATH = ACTIVE_CONFIG["CHECKPOINT_PATH"]
 LOG_INTERVAL = ACTIVE_CONFIG["LOG_INTERVAL"]

@@ -63,6 +63,19 @@ def build_args_from_config():
     )
 
 
+def ensure_stage_checkpoint_name(filename, train_stage):
+    if train_stage not in {"pretrain", "sft"}:
+        raise ValueError(f"Unknown train_stage: {train_stage}")
+
+    stem, ext = os.path.splitext(filename)
+    stage_token = f"_{train_stage}"
+
+    if stage_token in stem:
+        return filename
+
+    return f"{stem}{stage_token}{ext}"
+
+
 def log_message(message, log_file=None):
     message = str(message)
     safe_message = message.encode("gbk", errors="replace").decode("gbk")
@@ -209,6 +222,15 @@ def generate_during_training(model, tokenizer, prompt, args, device):
 
 
 def train(args):
+    args.checkpoint_prefix = ensure_stage_checkpoint_name(
+        args.checkpoint_prefix,
+        args.train_stage,
+    )
+    args.checkpoint_path = ensure_stage_checkpoint_name(
+        args.checkpoint_path,
+        args.train_stage,
+    )
+
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.text_log_dir, exist_ok=True)

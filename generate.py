@@ -8,36 +8,44 @@ from config import *
 from k_model import ModelConfig, Transformer
 
 
-def find_latest_checkpoint():
-    search_dirs = [CHECKPOINT_DIR, "."]
+def checkpoint_matches_stage(filename, stage):
+    stem, ext = os.path.splitext(filename)
+    return ext == ".pt" and f"_{stage}" in stem
+
+
+def find_latest_checkpoint(stage=None):
+    stage = stage or TRAIN_STAGE
+    if stage not in {"pretrain", "sft"}:
+        raise ValueError(f"Unknown TRAIN_STAGE: {stage}")
+
     candidates = []
 
-    for search_dir in search_dirs:
-        if not os.path.isdir(search_dir):
+    if not os.path.isdir(CHECKPOINT_DIR):
+        raise FileNotFoundError(f"checkpoint directory not found: {CHECKPOINT_DIR}")
+
+    for filename in os.listdir(CHECKPOINT_DIR):
+        if not checkpoint_matches_stage(filename, stage):
             continue
 
-        for filename in os.listdir(search_dir):
-            if not filename.endswith(".pt"):
-                continue
-
-            path = os.path.join(search_dir, filename)
-            if os.path.isfile(path):
-                candidates.append(path)
+        path = os.path.join(CHECKPOINT_DIR, filename)
+        if os.path.isfile(path):
+            candidates.append(path)
 
     if not candidates:
         raise FileNotFoundError(
-            f"No .pt checkpoint found in current directory or {CHECKPOINT_DIR}"
+            f"No {stage} .pt checkpoint found in {CHECKPOINT_DIR}"
         )
 
     return max(candidates, key=os.path.getmtime)
 
 
-def load_model(checkpoint_path=None):
+def load_model(checkpoint_path=None, stage=None):
+    stage = stage or TRAIN_STAGE
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
     if checkpoint_path is None:
-        checkpoint_path = find_latest_checkpoint()
+        checkpoint_path = find_latest_checkpoint(stage)
 
     print(f"checkpoint: {checkpoint_path}")
 
@@ -46,6 +54,11 @@ def load_model(checkpoint_path=None):
         map_location=device,
         weights_only=False,
     )
+    checkpoint_stage = checkpoint.get("train_stage")
+    if checkpoint_stage is not None and checkpoint_stage != stage:
+        raise ValueError(
+            f"checkpoint stage mismatch: expected {stage}, got {checkpoint_stage}"
+        )
 
     tokenizer_name = checkpoint.get("tokenizer_name", TOKENIZER_NAME)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
