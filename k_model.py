@@ -7,7 +7,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 
 class ModelConfig(PretrainedConfig):
-    model_type = "transformer"
+    model_type = "tiny-k"
 
     def __init__(
         self,
@@ -59,9 +59,15 @@ def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0):
 
 
 def reshape_for_broadcast(freqs: torch.Tensor, x: torch.Tensor):
-    assert x.dim() == 4
+    ndim = x.ndim
+    # 断言，确保1在x的维度范围内
+    assert 0 <= 1 < ndim
+    # 断言，确保freqs_cis的形状与x的第二维和最后一维相同
     assert freqs.shape == (x.shape[1], x.shape[-1])
-    return freqs.unsqueeze(0).unsqueeze(2)
+    # 构造一个新的形状，除了第二维和最后一维，其他维度都为1，这样做是为了能够将freqs_cis与x进行广播操作
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    # 将freqs_cis调整为新的形状，并返回
+    return freqs.view(shape)
 
 
 def apply_rotary_emb(
@@ -256,6 +262,7 @@ class DecoderLayer(nn.Module):
 
 class Transformer(PreTrainedModel):
     config_class = ModelConfig
+    _tied_weights_keys = {"output.weight": "tok_embeddings.weight"}
 
     def __init__(
         self,
@@ -343,6 +350,31 @@ class Transformer(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _left_pad_by_attention_mask(
+            self,
+            idx: torch.Tensor,
+            attention_mask,
+            pad_token_id
+    ):
+        if attention_mask is None or attention_mask.all():
+            return idx, attention_mask
+
+        bsz = idx.size(0)
+        lengths = attention_mask.long().sum(dim=1)
+        max_len = max(int(lengths.max().item()), 1)
+        packed_idx = idx.new_full((bsz, max_len), pad_token_id)
+        packed_mask = attention_mask.new_zeros((bsz, max_len), dtype=torch.bool)
+
+        for row in range(bsz):
+            valid_len = int(lengths[row].item())
+            if valid_len <= 0:
+                continue
+            valid_tokens = idx[row][attention_mask[row]]
+            packed_idx[row, max_len - valid_len:] = valid_tokens
+            packed_mask[row, max_len - valid_len:] = True
+
+        return packed_idx, packed_mask
+
     def forward(self, idx, targets=None, attention_mask=None):
         batch_size, seq_len = idx.shape
         assert seq_len <= self.max_seq_len, "input sequence length exceeds max_seq_len"
@@ -390,5 +422,5 @@ if __name__ == "__main__":
     print("model dim:", model.dim)
     print("num layers:", model.n_layers)
     print("vocab size:", model.vocab_size)
-    print("seq len:", model.max_seq_len)
+    print("max_seq_len:", model.max_seq_len)
     print("norm eps:", model.norm_eps)

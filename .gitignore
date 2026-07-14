@@ -1,10 +1,11 @@
 data/
 checkpoints/
+checkpoints_well/
 runs/
 logs/
 __pycache__/
 .idea/
-
+outputs/
 *.pt
 *.pth
 *.bin
