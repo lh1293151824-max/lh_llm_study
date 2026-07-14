@@ -47,7 +47,6 @@ def build_args_from_config(stage=None, mode=None):
         n_kv_heads=active_config["N_KV_HEADS"],
         norm_eps=active_config["NORM_EPS"],
         dropout=active_config["DROPOUT"],
-        flash_attn=active_config["FLASH_ATTN"],
         multiple_of=active_config["MULTIPLE_OF"],
         checkpoint_dir=active_config["CHECKPOINT_DIR"],
         checkpoint_prefix=active_config["CHECKPOINT_PREFIX"],
@@ -112,7 +111,7 @@ def get_lr(step, total_steps, args):
     return min_lr + coeff * (args.learning_rate - min_lr)
 
 
-def build_model_config(vocab_size, args):
+def build_model_config(vocab_size, args, pad_token_id=None):
     return ModelConfig(
         vocab_size=vocab_size,
         max_seq_len=args.max_seq_len,
@@ -124,7 +123,7 @@ def build_model_config(vocab_size, args):
         multiple_of=args.multiple_of,
         norm_eps=args.norm_eps,
         dropout=args.dropout,
-        flash_attn=args.flash_attn,
+        pad_token_id=pad_token_id,
     )
 
 
@@ -169,7 +168,8 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
             attention_mask = attention_mask.to(device, non_blocking=True)
 
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
-                _, loss = model(x, labels, attention_mask=attention_mask)
+                outputs = model(x, labels, attention_mask=attention_mask)
+                loss = outputs["last_loss"]
                 loss_mask = loss_mask.view(-1)
                 valid_tokens = loss_mask.sum()
                 if valid_tokens.item() == 0:
@@ -207,7 +207,7 @@ def save_checkpoint(model, optimizer, tokenizer, epoch, avg_loss, save_path, glo
             "multiple_of": args.multiple_of,
             "norm_eps": args.norm_eps,
             "dropout": args.dropout,
-            "flash_attn": args.flash_attn,
+            "pad_token_id": tokenizer.pad_token_id,
         },
         "vocab_size": len(tokenizer),
         "max_seq_len": args.max_seq_len,
@@ -311,6 +311,7 @@ def train(args):
     log_message(f"device: {device}", log_file)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer.padding_side = "left"
 
     if not os.path.exists(args.data_path):
         raise FileNotFoundError(f"training data not found: {args.data_path}")
@@ -371,7 +372,11 @@ def train(args):
     assert args.dim % args.n_heads == 0, "dim must be divisible by n_heads"
     assert args.n_heads % args.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
 
-    model_config = build_model_config(vocab_size=len(tokenizer), args=args)
+    model_config = build_model_config(
+        vocab_size=len(tokenizer),
+        args=args,
+        pad_token_id=tokenizer.pad_token_id,
+    )
     model = Transformer(config=model_config).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -425,12 +430,17 @@ def train(args):
             log_file=log_file,
         )
     model.train()
+    if args.accumulation_steps <= 0:
+        raise ValueError("accumulation_steps must be greater than 0")
     total_steps = args.epochs * len(train_loader)
     avg_loss = 0.0
     stage_label = f"[{args.train_stage}]"
+    last_step_checkpoint = global_step
 
     for epoch in range(start_epoch, args.epochs):
         total_loss = 0.0
+        valid_batch_count = 0
+        accumulated_batches = 0
         current_epoch = epoch + 1
         optimizer.zero_grad(set_to_none=True)
         pbar = tqdm(
@@ -449,25 +459,28 @@ def train(args):
                 param_group["lr"] = lr
 
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
-                _, loss = model(x, labels, attention_mask=attention_mask)
+                outputs = model(x, labels, attention_mask=attention_mask)
+                loss = outputs["last_loss"]
                 loss_mask = loss_mask.view(-1)
                 valid_tokens = loss_mask.sum()
                 if valid_tokens.item() == 0:
                     continue
                 loss = torch.sum(loss * loss_mask) / valid_tokens
-                loss_back = loss / args.accumulation_steps
 
-            scaler.scale(loss_back).backward()
+            scaler.scale(loss).backward()
+            accumulated_batches += 1
+            valid_batch_count += 1
 
-            is_update_step = (step + 1) % args.accumulation_steps == 0
-            is_last_step = (step + 1) == len(train_loader)
-
-            if is_update_step or is_last_step:
+            if accumulated_batches == args.accumulation_steps:
                 scaler.unscale_(optimizer)
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(accumulated_batches)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                accumulated_batches = 0
 
             total_loss += loss.item()
             writer.add_scalar("train/batch_loss", loss.item(), global_step)
@@ -512,7 +525,11 @@ def train(args):
                     tqdm.write(val_message)
                     log_message(val_message, log_file)
 
-            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+            if (
+                args.save_every_steps > 0
+                and global_step - last_step_checkpoint >= args.save_every_steps
+                and accumulated_batches == 0
+            ):
                 step_save_path = os.path.join(
                     args.checkpoint_dir,
                     f"{args.checkpoint_prefix}_step_{global_step}.pt",
@@ -529,8 +546,25 @@ def train(args):
                     args=args,
                     log_file=log_file,
                 )
+                last_step_checkpoint = global_step
 
-        avg_loss = total_loss / len(train_loader)
+        if accumulated_batches > 0:
+            scaler.unscale_(optimizer)
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(accumulated_batches)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if valid_batch_count == 0:
+            raise RuntimeError(
+                f"No valid training batches found in epoch {current_epoch}. "
+                "Check the dataset and loss masks."
+            )
+
+        avg_loss = total_loss / valid_batch_count
         writer.add_scalar("train/epoch_avg_loss", avg_loss, current_epoch)
         epoch_message = (
             f"{stage_label} epoch={current_epoch}/{args.epochs} | "
@@ -577,5 +611,5 @@ def train(args):
 
 
 if __name__ == "__main__":
-    
+
     train(build_args_from_config())

@@ -80,6 +80,7 @@ def export_model_from_checkpoint(
         tokenizer_path,
         trust_remote_code=True,
     )
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is not None:
         model_config.pad_token_id = tokenizer.pad_token_id
 

@@ -21,7 +21,6 @@ class ModelConfig(PretrainedConfig):
         norm_eps: float = 1e-5,
         max_seq_len: int = 512,
         dropout: float = 0.0,
-        flash_attn: bool = False,
         **kwargs,
     ):
         self.dim = dim
@@ -34,7 +33,6 @@ class ModelConfig(PretrainedConfig):
         self.norm_eps = norm_eps
         self.max_seq_len = max_seq_len
         self.dropout = dropout
-        self.flash_attn = flash_attn
         super().__init__(**kwargs)
 
 
@@ -120,7 +118,6 @@ class Attention(nn.Module):
         n_heads=8,
         n_kv_heads=None,
         dropout=0.0,
-        flash_attn=False,
     ):
         super().__init__()
 
@@ -136,7 +133,6 @@ class Attention(nn.Module):
         self.head_dim = dim_embedding // n_heads
         self.n_rep = n_heads // n_kv_heads
         self.dropout = dropout
-        self.flash_attn = flash_attn and hasattr(F, "scaled_dot_product_attention")
 
         self.wq = nn.Linear(dim_embedding, n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(dim_embedding, n_kv_heads * self.head_dim, bias=False)
@@ -170,25 +166,24 @@ class Attention(nn.Module):
                 attention_mask = attention_mask[:, None, None, :]
             attention_mask = attention_mask.bool()
 
-        if self.flash_attn:
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-            scores = scores.masked_fill(~mask, float("-inf"))
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        mask = torch.tril(
+            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool)
+        )
 
-            if attention_mask is not None:
-                scores = scores.masked_fill(~attention_mask, float("-inf"))
-            attn = torch.softmax(scores, dim=-1)
-            attn = self.attn_dropout(attn)
-            out = attn @ v
+        if attention_mask is not None:
+            mask = mask[None, None, :, :] & attention_mask
+            empty_rows = ~mask.any(dim=-1, keepdim=True)
+            diagonal_mask = torch.eye(
+                seq_len,
+                device=x.device,
+                dtype=torch.bool,
+            )[None, None, :, :]
+            mask = mask | (empty_rows & diagonal_mask)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = attn @ v
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, dim_embedding)
         return self.resid_dropout(self.wo(out))
@@ -228,7 +223,6 @@ class DecoderLayer(nn.Module):
         n_kv_heads=None,
         norm_eps: float = 1e-5,
         dropout: float = 0.0,
-        flash_attn: bool = False,
         hidden_dim=None,
         multiple_of: int = 64,
     ):
@@ -239,7 +233,6 @@ class DecoderLayer(nn.Module):
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             dropout=dropout,
-            flash_attn=flash_attn,
         )
         self.ffn_norm = RMSNorm(dim_embedding, eps=norm_eps)
         self.feed_forward = MLP(
@@ -285,6 +278,7 @@ class Transformer(PreTrainedModel):
 
         super().__init__(config)
         self.config = config
+        self.OUT = {}
         self.vocab_size = config.vocab_size
         self.max_seq_len = config.max_seq_len
         self.dim = config.dim
@@ -294,7 +288,6 @@ class Transformer(PreTrainedModel):
         self.n_layers = config.n_layers
         self.norm_eps = config.norm_eps
         self.dropout = config.dropout
-        self.flash_attn = config.flash_attn
         self.hidden_dim = config.hidden_dim
         self.multiple_of = config.multiple_of
 
@@ -321,7 +314,6 @@ class Transformer(PreTrainedModel):
                     n_kv_heads=self.n_kv_heads,
                     norm_eps=self.norm_eps,
                     dropout=self.dropout,
-                    flash_attn=self.flash_attn,
                     hidden_dim=self.hidden_dim,
                     multiple_of=self.multiple_of,
                 )
@@ -350,32 +342,8 @@ class Transformer(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _left_pad_by_attention_mask(
-            self,
-            idx: torch.Tensor,
-            attention_mask,
-            pad_token_id
-    ):
-        if attention_mask is None or attention_mask.all():
-            return idx, attention_mask
-
-        bsz = idx.size(0)
-        lengths = attention_mask.long().sum(dim=1)
-        max_len = max(int(lengths.max().item()), 1)
-        packed_idx = idx.new_full((bsz, max_len), pad_token_id)
-        packed_mask = attention_mask.new_zeros((bsz, max_len), dtype=torch.bool)
-
-        for row in range(bsz):
-            valid_len = int(lengths[row].item())
-            if valid_len <= 0:
-                continue
-            valid_tokens = idx[row][attention_mask[row]]
-            packed_idx[row, max_len - valid_len:] = valid_tokens
-            packed_mask[row, max_len - valid_len:] = True
-
-        return packed_idx, packed_mask
-
     def forward(self, idx, targets=None, attention_mask=None):
+        #训练以及推理全部用左padding
         batch_size, seq_len = idx.shape
         assert seq_len <= self.max_seq_len, "input sequence length exceeds max_seq_len"
 
@@ -389,19 +357,29 @@ class Transformer(PreTrainedModel):
         x = self.norm(x)
 
         if targets is None:
+
             logits = self.output(x[:, [-1], :])
-            return logits
+            self.last_loss = None
+        else:
+            logits = self.output(x)
 
-        logits = self.output(x)
+            batch_size, seq_len, vocab_size = logits.shape
+            loss_targets = targets
+            if attention_mask is not None:
+                loss_targets = targets.masked_fill(
+                    ~attention_mask.bool(),
+                    -100,
+                )
 
-        batch_size, seq_len, vocab_size = logits.shape
-        loss = F.cross_entropy(
-            logits.reshape(batch_size * seq_len, vocab_size),
-            targets.reshape(batch_size * seq_len),
-            ignore_index=-100,
-            reduction="none",
-        )
-        return logits, loss
+            self.last_loss = F.cross_entropy(
+                logits.reshape(batch_size * seq_len, vocab_size),
+                loss_targets.reshape(batch_size * seq_len),
+                ignore_index=-100,
+                reduction="none",
+            )
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('last_loss', self.last_loss)
+        return self.OUT
 
 
 if __name__ == "__main__":
@@ -418,7 +396,7 @@ if __name__ == "__main__":
     out = model(x)
 
     print("input shape:", x.shape)
-    print("output shape:", out.shape)
+    print("output shape:", out["logits"].shape)
     print("model dim:", model.dim)
     print("num layers:", model.n_layers)
     print("vocab size:", model.vocab_size)

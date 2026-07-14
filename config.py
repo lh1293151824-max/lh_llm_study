@@ -163,7 +163,6 @@ MODEL_TRAIN_CONFIG = {
     "N_KV_HEADS": 8,
     "NORM_EPS": 1e-5,
     "DROPOUT": 0.0,
-    "FLASH_ATTN": False,  # Options: True, False
     "MULTIPLE_OF": 64,
 }
 
@@ -174,7 +173,6 @@ MODEL_TEST_CONFIG = {
     "N_KV_HEADS": 2,
     "NORM_EPS": 1e-5,
     "DROPOUT": 0.0,
-    "FLASH_ATTN": False,  # Options: True, False
     "MULTIPLE_OF": 64,
 }
 

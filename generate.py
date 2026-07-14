@@ -68,6 +68,7 @@ def load_model(checkpoint_path=None, stage=None):
 
     tokenizer_name = checkpoint.get("tokenizer_name", cfg.TOKENIZER_NAME)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer.padding_side = "left"
 
     if "model_config" in checkpoint:
         model_config = ModelConfig(**checkpoint["model_config"])

@@ -41,18 +41,19 @@ class PretrainDataset(Dataset):
             f"{sample['text']}"
             f"{self.tokenizer.eos_token}"
         )
-        input_ids = self.tokenizer(text).data["input_ids"][: self.max_length]
+        input_ids = self.tokenizer(text,add_special_tokens=False).data["input_ids"][: self.max_length]
 
         text_len = len(input_ids)
         padding_len = self.max_length - text_len
-        input_ids = input_ids + [self.padding] * padding_len
-        loss_mask = [1] * text_len + [0] * padding_len
-        attention_mask = [1] * text_len + [0] * padding_len
+
+        input_ids = [self.padding] * padding_len + input_ids
+        loss_mask = [0] * padding_len + [1] * text_len
+        attention_mask = [0] * padding_len + [1] * text_len
 
         input_ids = np.array(input_ids)
         x = np.array(input_ids[:-1]).astype(np.int64)
         y = np.array(input_ids[1:]).astype(np.int64)
-        loss_mask = np.array(loss_mask[1:]).astype(np.int64)
+        loss_mask = np.array(loss_mask[1:]).astype(np.int64)*np.array(loss_mask[:-1]).astype(np.int64)
         attention_mask = np.array(attention_mask[:-1]).astype(np.int64)
 
         return (
@@ -90,7 +91,7 @@ class SFTDataset(Dataset):
 
     def generate_loss_mask(self, input_ids):
         mask = [0] * len(input_ids)
-        assistant_sequence = self.tokenizer("<|im_start|>assistant\n").data["input_ids"]
+        assistant_sequence = self.tokenizer("<|im_start|>assistant\n",add_special_tokens=False).data["input_ids"]
         assistant_sequence_length = len(assistant_sequence)
         token_count = len(input_ids)
         index = 0
@@ -132,12 +133,12 @@ class SFTDataset(Dataset):
             tokenize=False,
             add_generation_prompt=False,
         )
-        input_ids = self.tokenizer(text).data["input_ids"][: self.max_length]
+        input_ids = self.tokenizer(text, add_special_tokens=False).data["input_ids"][: self.max_length]
 
         text_len = len(input_ids)
         padding_len = self.max_length - text_len
-        input_ids = input_ids + [self.padding] * padding_len
-        attention_mask = [1] * text_len + [0] * padding_len
+        input_ids = [self.padding] * padding_len+input_ids
+        attention_mask = [0] * padding_len+[1] * text_len
         loss_mask = self.generate_loss_mask(input_ids)
 
         input_ids = np.array(input_ids)

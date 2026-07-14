@@ -92,6 +92,7 @@ def create_tokenizer_config(save_dir: str = None) -> None:
         "add_bos_token": False,
         "add_eos_token": False,
         "add_prefix_space": False,
+        "padding_side": "left",
         "bos_token": "<|im_start|>",
         "eos_token": "<|im_end|>",
         "pad_token": "<|im_end|>",
@@ -135,6 +136,7 @@ def eval_tokenizer(tokenizer_path: str = None) -> None:
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        tokenizer.padding_side = "left"
     except Exception as exc:
         print(f"Error loading tokenizer: {exc}")
         return
