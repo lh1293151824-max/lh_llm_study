@@ -143,7 +143,29 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x, freqs_cos, freqs_sin, attention_mask=None):
+        if x.dim() != 3:
+            raise ValueError("x must have shape [batch_size, seq_len, dim]")
+        if not x.is_floating_point():
+            raise TypeError("x must be a floating-point tensor")
+
         batch_size, seq_len, dim_embedding = x.shape
+        if dim_embedding != self.dim_embedding:
+            raise ValueError(
+                f"Expected x.size(-1)={self.dim_embedding}, "
+                f"got {dim_embedding}"
+            )
+
+        expected_freqs_shape = (seq_len, self.head_dim // 2)
+        if freqs_cos.shape != expected_freqs_shape:
+            raise ValueError(
+                f"freqs_cos must have shape {expected_freqs_shape}, "
+                f"got {tuple(freqs_cos.shape)}"
+            )
+        if freqs_sin.shape != expected_freqs_shape:
+            raise ValueError(
+                f"freqs_sin must have shape {expected_freqs_shape}, "
+                f"got {tuple(freqs_sin.shape)}"
+            )
 
         q = self.wq(x)
         k = self.wk(x)
@@ -163,8 +185,22 @@ class Attention(nn.Module):
 
         if attention_mask is not None:
             if attention_mask.dim() == 2:
+                if attention_mask.shape != (batch_size, seq_len):
+                    raise ValueError(
+                        "A 2D attention_mask must have shape "
+                        f"[{batch_size}, {seq_len}]"
+                    )
                 attention_mask = attention_mask[:, None, None, :]
-            attention_mask = attention_mask.bool()
+            elif attention_mask.dim() == 4:
+                expected_mask_shape = (batch_size, 1, 1, seq_len)
+                if attention_mask.shape != expected_mask_shape:
+                    raise ValueError(
+                        "A 4D attention_mask must have shape "
+                        f"{expected_mask_shape}"
+                    )
+            else:
+                raise ValueError("attention_mask must be either 2D or 4D")
+            attention_mask = attention_mask.to(device=x.device, dtype=torch.bool)
 
         scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
         mask = torch.tril(
@@ -343,9 +379,34 @@ class Transformer(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, attention_mask=None):
-        #训练以及推理全部用左padding
+        if idx.dim() != 2:
+            raise ValueError("idx must have shape [batch_size, seq_len]")
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise TypeError("idx must use torch.int32 or torch.int64")
+
         batch_size, seq_len = idx.shape
-        assert seq_len <= self.max_seq_len, "input sequence length exceeds max_seq_len"
+        if seq_len == 0:
+            raise ValueError("idx must contain at least one token")
+        if seq_len > self.max_seq_len:
+            raise ValueError("input sequence length exceeds max_seq_len")
+
+        if targets is not None:
+            if targets.dim() != 2 or targets.shape != idx.shape:
+                raise ValueError("targets must have the same 2D shape as idx")
+            if targets.dtype != torch.int64:
+                raise TypeError("targets must use torch.int64")
+            if targets.device != idx.device:
+                raise ValueError("targets and idx must be on the same device")
+
+        if attention_mask is not None:
+            if attention_mask.dim() != 2 or attention_mask.shape != idx.shape:
+                raise ValueError(
+                    "attention_mask must have the same 2D shape as idx"
+                )
+            attention_mask = attention_mask.to(
+                device=idx.device,
+                dtype=torch.bool,
+            )
 
         x = self.embedding_dropout(self.tok_embeddings(idx))
         freqs_cos = self.freqs_cos[:seq_len].to(x.device)
@@ -380,6 +441,109 @@ class Transformer(PreTrainedModel):
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('last_loss', self.last_loss)
         return self.OUT
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        idx,
+        stop_id=None,
+        max_new_tokens=256,
+        temperature=1.0,
+        top_k=None,
+        attention_mask=None,
+        pad_token_id=None,
+    ):
+        if idx.dim() != 2:
+            raise ValueError("idx must have shape [batch_size, seq_len]")
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise TypeError("idx must use torch.int32 or torch.int64")
+        if idx.size(1) == 0:
+            raise ValueError("idx must contain at least one token")
+        if not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a non-negative integer")
+        if not isinstance(temperature, (int, float)) or temperature < 0:
+            raise ValueError("temperature must be greater than or equal to 0")
+        if top_k is not None and (not isinstance(top_k, int) or top_k <= 0):
+            raise ValueError("top_k must be a positive integer or None")
+
+        if pad_token_id is None:
+            pad_token_id = (
+                self.config.pad_token_id
+                if self.config.pad_token_id is not None
+                else 0
+            )
+        if not isinstance(pad_token_id, int) or not 0 <= pad_token_id < self.vocab_size:
+            raise ValueError("pad_token_id must be a valid vocabulary index")
+        if stop_id is not None and (
+            not isinstance(stop_id, int) or not 0 <= stop_id < self.vocab_size
+        ):
+            raise ValueError("stop_id must be a valid vocabulary index or None")
+
+        if attention_mask is None:
+            if idx.size(0) == 1:
+                attention_mask = torch.ones_like(idx, dtype=torch.bool)
+            else:
+                raise ValueError(
+                    "attention_mask is required when batch size is greater than 1"
+                )
+        else:
+            if attention_mask.dim() != 2 or attention_mask.shape != idx.shape:
+                raise ValueError(
+                    "attention_mask must have the same 2D shape as idx"
+                )
+            attention_mask = attention_mask.to(
+                device=idx.device,
+                dtype=torch.bool,
+            )
+
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        start_index = idx.size(1)
+
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.max_seq_len :]
+            mask_cond = attention_mask[:, -self.max_seq_len :]
+
+            outputs = self(idx_cond, attention_mask=mask_cond)
+            logits = outputs["logits"][:, -1, :]
+
+            if temperature == 0.0:
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k is not None and top_k > 0:
+                    k = min(top_k, logits.size(-1))
+                    top_values, _ = torch.topk(logits, k, dim=-1)
+                    logits = logits.masked_fill(
+                        logits < top_values[:, [-1]],
+                        float("-inf"),
+                    )
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+            prev_finished = finished.clone()
+            if stop_id is not None:
+                if prev_finished.any():
+                    idx_next = torch.where(
+                        prev_finished[:, None],
+                        torch.full_like(idx_next, pad_token_id),
+                        idx_next,
+                    )
+                finished = prev_finished | idx_next[:, 0].eq(stop_id)
+
+            idx = torch.cat((idx, idx_next), dim=1)
+            next_mask = torch.ones(
+                (attention_mask.size(0), 1),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            if prev_finished.any():
+                next_mask[prev_finished] = 0
+            attention_mask = torch.cat((attention_mask, next_mask), dim=1)
+
+            if stop_id is not None and finished.all():
+                break
+
+        return idx[:, start_index:]
 
 
 if __name__ == "__main__":

@@ -225,6 +225,36 @@ TEST_CONFIG = {
 
 
 # =============================================================================
+# Text generation sample config
+# =============================================================================
+
+# Options: "pretrain", "sft"
+SAMPLE_STAGE = TRAIN_STAGE
+
+# Empty checkpoint path: automatically use the latest checkpoint for SAMPLE_STAGE.
+SAMPLE_CHECKPOINT_PATH = ""
+SAMPLE_TOKENIZER_PATH = TOKENIZER_NAME
+SAMPLE_SEED = 42
+SAMPLE_DEVICE = ""  # Empty: automatically select CUDA or CPU.
+SAMPLE_DTYPE = "float32"  # Options: "float32", "float16", "bfloat16"
+
+SAMPLE_CONFIG_TABLE = {
+    "pretrain": {
+        "NUM_SAMPLES": 1,
+        "MAX_NEW_TOKENS": 120,
+        "TEMPERATURE": 0.75,
+        "TOP_K": 3,
+    },
+    "sft": {
+        "NUM_SAMPLES": 1,
+        "MAX_NEW_TOKENS": 128,
+        "TEMPERATURE": 0.6,
+        "TOP_K": 3,
+    },
+}
+
+
+# =============================================================================
 # Stage configs
 # =============================================================================
 
@@ -281,6 +311,14 @@ def get_active_config(stage=None, mode=None):
     active.update(STAGE_CONFIG_TABLE[stage])
 
     return active
+
+
+def get_sample_config(stage=None):
+    """Return text-generation sample settings for pretrain or SFT."""
+    stage = stage or SAMPLE_STAGE
+    if stage not in SAMPLE_CONFIG_TABLE:
+        raise ValueError('SAMPLE_STAGE must be "pretrain" or "sft"')
+    return dict(SAMPLE_CONFIG_TABLE[stage])
 
 
 def get_pretrain_original_source_limits(mode=None):
