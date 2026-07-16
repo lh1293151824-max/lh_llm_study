@@ -153,7 +153,7 @@ SYSTEM_PROMPT = "你是一个AI助手"
 
 
 # =============================================================================
-# Model architecture configs
+# DeepONet output configs
 # =============================================================================
 
 # Options: "linear", "deeponet", "hybrid"
@@ -168,6 +168,11 @@ OPERATOR_ALPHA = 0.9
 # Warn during validation when Linear/DeepONet logit RMS values differ by more
 # than this ratio.
 OPERATOR_SCALE_WARNING_RATIO = 100.0
+
+
+# =============================================================================
+# Model architecture configs
+# =============================================================================
 
 MODEL_TRAIN_CONFIG = {
     "DIM_EMBEDDING": 1024,
