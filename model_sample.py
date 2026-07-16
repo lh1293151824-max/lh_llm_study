@@ -5,7 +5,12 @@ import torch
 from transformers import AutoTokenizer
 
 import config as cfg
-from k_model import ModelConfig, Transformer
+from k_model import (
+    ModelConfig,
+    Transformer,
+    infer_output_head_type_from_state_dict,
+    validate_state_dict_output_head_type,
+)
 
 
 
@@ -77,8 +82,14 @@ class TextGenerator:
 
         self.model = Transformer(config=model_config).to(self.device)
         state_dict = self._extract_state_dict(checkpoint_data)
+        state_dict = self._clean_state_dict_prefix(state_dict)
+        validate_state_dict_output_head_type(
+            state_dict,
+            expected=model_config.output_head_type,
+            context="sampling checkpoint",
+        )
         missing_keys, unexpected_keys = self.model.load_state_dict(
-            self._clean_state_dict_prefix(state_dict),
+            state_dict,
             strict=False,
         )
         self.model.eval()
@@ -215,6 +226,16 @@ class TextGenerator:
             if isinstance(hidden_weight, torch.Tensor)
             else None
         )
+        output_head_type = infer_output_head_type_from_state_dict(state_dict)
+        operator_weight = state_dict.get(
+            "operator_output.branch_output.weight"
+        )
+        operator_rank = (
+            operator_weight.size(0)
+            if isinstance(operator_weight, torch.Tensor)
+            and operator_weight.dim() == 2
+            else cfg.OPERATOR_RANK
+        )
 
         return ModelConfig(
             vocab_size=vocab_size,
@@ -227,6 +248,12 @@ class TextGenerator:
             multiple_of=active_config["MULTIPLE_OF"],
             norm_eps=active_config["NORM_EPS"],
             dropout=active_config["DROPOUT"],
+            output_head_type=output_head_type,
+            operator_rank=operator_rank,
+            operator_alpha=cfg.OPERATOR_ALPHA,
+            operator_scale_warning_ratio=(
+                cfg.OPERATOR_SCALE_WARNING_RATIO
+            ),
         )
 
     @staticmethod

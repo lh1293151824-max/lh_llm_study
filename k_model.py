@@ -5,6 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel
 
+try:
+    from .deeponet import DeepONetOutputHead
+except ImportError:
+    from deeponet import DeepONetOutputHead
+
+
+OUTPUT_HEAD_TYPES = frozenset({"linear", "deeponet", "hybrid"})
+
 
 class ModelConfig(PretrainedConfig):
     model_type = "tiny-k"
@@ -21,8 +29,42 @@ class ModelConfig(PretrainedConfig):
         norm_eps: float = 1e-5,
         max_seq_len: int = 512,
         dropout: float = 0.0,
+        output_head_type: str = "linear",
+        operator_rank: int = 1024,
+        operator_alpha: float = 0.9,
+        operator_scale_warning_ratio: float = 100.0,
         **kwargs,
     ):
+        if output_head_type not in OUTPUT_HEAD_TYPES:
+            raise ValueError(
+                f"output_head_type must be one of {sorted(OUTPUT_HEAD_TYPES)}"
+            )
+        if (
+            not isinstance(operator_rank, int)
+            or isinstance(operator_rank, bool)
+            or operator_rank <= 0
+        ):
+            raise ValueError("operator_rank must be a positive integer")
+        if (
+            not isinstance(operator_alpha, (int, float))
+            or isinstance(operator_alpha, bool)
+        ):
+            raise TypeError("operator_alpha must be a number")
+        if not math.isfinite(operator_alpha) or not 0.0 <= operator_alpha <= 1.0:
+            raise ValueError("operator_alpha must be finite and in [0, 1]")
+        if (
+            not isinstance(operator_scale_warning_ratio, (int, float))
+            or isinstance(operator_scale_warning_ratio, bool)
+        ):
+            raise TypeError("operator_scale_warning_ratio must be a number")
+        if (
+            not math.isfinite(operator_scale_warning_ratio)
+            or operator_scale_warning_ratio <= 1.0
+        ):
+            raise ValueError(
+                "operator_scale_warning_ratio must be finite and greater than 1"
+            )
+
         self.dim = dim
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -33,7 +75,41 @@ class ModelConfig(PretrainedConfig):
         self.norm_eps = norm_eps
         self.max_seq_len = max_seq_len
         self.dropout = dropout
+        self.output_head_type = output_head_type
+        self.operator_rank = operator_rank
+        self.operator_alpha = float(operator_alpha)
+        self.operator_scale_warning_ratio = float(
+            operator_scale_warning_ratio
+        )
         super().__init__(**kwargs)
+
+
+def infer_output_head_type_from_state_dict(state_dict):
+    """Infer the output architecture encoded by a project state dict."""
+
+    if not isinstance(state_dict, dict):
+        raise TypeError("state_dict must be a dictionary")
+
+    keys = {
+        key[len("_orig_mod.") :] if key.startswith("_orig_mod.") else key
+        for key in state_dict
+    }
+    has_operator = any(key.startswith("operator_output.") for key in keys)
+    has_linear = "output.weight" in keys
+    if has_operator:
+        return "hybrid" if has_linear else "deeponet"
+    return "linear"
+
+
+def validate_state_dict_output_head_type(state_dict, expected, context="checkpoint"):
+    if expected not in OUTPUT_HEAD_TYPES:
+        raise ValueError(f"unsupported expected output_head_type: {expected!r}")
+    inferred = infer_output_head_type_from_state_dict(state_dict)
+    if inferred != expected:
+        raise ValueError(
+            f"{context} output head mismatch: config={expected}, "
+            f"state_dict={inferred}"
+        )
 
 
 class RMSNorm(nn.Module):
@@ -291,7 +367,7 @@ class DecoderLayer(nn.Module):
 
 class Transformer(PreTrainedModel):
     config_class = ModelConfig
-    _tied_weights_keys = {"output.weight": "tok_embeddings.weight"}
+    _tied_weights_keys = ["output.weight"]
 
     def __init__(
         self,
@@ -326,6 +402,11 @@ class Transformer(PreTrainedModel):
         self.dropout = config.dropout
         self.hidden_dim = config.hidden_dim
         self.multiple_of = config.multiple_of
+        self.output_head_type = config.output_head_type
+        self.operator_alpha = config.operator_alpha
+        self.operator_scale_warning_ratio = (
+            config.operator_scale_warning_ratio
+        )
 
         assert self.dim % self.n_heads == 0, "dim must be divisible by n_heads"
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
@@ -357,7 +438,18 @@ class Transformer(PreTrainedModel):
             ]
         )
         self.norm = RMSNorm(self.dim, eps=self.norm_eps)
-        self.output = nn.Linear(self.dim, self.vocab_size, bias=False)
+        self.output = None
+        self.operator_output = None
+        if self.output_head_type in {"linear", "hybrid"}:
+            self.output = nn.Linear(self.dim, self.vocab_size, bias=False)
+        if self.output_head_type in {"deeponet", "hybrid"}:
+            self.operator_output = DeepONetOutputHead(
+                dim=self.dim,
+                operator_rank=config.operator_rank,
+                norm_eps=self.norm_eps,
+                dropout=self.dropout,
+                norm_layer=RMSNorm,
+            )
 
         self.apply(self._init_weights)
         for name, param in self.named_parameters():
@@ -368,7 +460,11 @@ class Transformer(PreTrainedModel):
                     std=0.02 / math.sqrt(2 * self.n_layers),
                 )
 
-        self.output.weight = self.tok_embeddings.weight
+        if self.output is not None:
+            self.output.weight = self.tok_embeddings.weight
+            self._tied_weights_keys = ["output.weight"]
+        else:
+            self._tied_weights_keys = []
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -377,6 +473,39 @@ class Transformer(PreTrainedModel):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    @staticmethod
+    def _logit_scale_ratio(linear_logits, operator_logits):
+        linear_rms = linear_logits.detach().float().pow(2).mean().sqrt()
+        operator_rms = operator_logits.detach().float().pow(2).mean().sqrt()
+        smaller = torch.minimum(linear_rms, operator_rms)
+        larger = torch.maximum(linear_rms, operator_rms)
+        eps = torch.finfo(torch.float32).eps
+        return larger.clamp_min(eps) / smaller.clamp_min(eps)
+
+    def _compute_logits(self, x, diagnose_scale=False):
+        if self.output_head_type == "linear":
+            return self.output(x), None
+
+        operator_logits = self.operator_output(
+            x,
+            self.tok_embeddings.weight,
+        )
+        if self.output_head_type == "deeponet":
+            return operator_logits, None
+
+        linear_logits = self.output(x)
+        logits = (
+            (1.0 - self.operator_alpha) * linear_logits
+            + self.operator_alpha * operator_logits
+        )
+        scale_ratio = None
+        if diagnose_scale:
+            scale_ratio = self._logit_scale_ratio(
+                linear_logits,
+                operator_logits,
+            )
+        return logits, scale_ratio
 
     def forward(self, idx, targets=None, attention_mask=None):
         if idx.dim() != 2:
@@ -417,13 +546,21 @@ class Transformer(PreTrainedModel):
 
         x = self.norm(x)
 
-        if targets is None:
+        self.OUT.pop("output_scale_ratio", None)
+        output_x = x if targets is not None else x[:, [-1], :]
+        diagnose_scale = (
+            self.output_head_type == "hybrid"
+            and not self.training
+            and targets is not None
+        )
+        logits, scale_ratio = self._compute_logits(
+            output_x,
+            diagnose_scale=diagnose_scale,
+        )
 
-            logits = self.output(x[:, [-1], :])
+        if targets is None:
             self.last_loss = None
         else:
-            logits = self.output(x)
-
             batch_size, seq_len, vocab_size = logits.shape
             loss_targets = targets
             if attention_mask is not None:
@@ -438,8 +575,10 @@ class Transformer(PreTrainedModel):
                 ignore_index=-100,
                 reduction="none",
             )
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('last_loss', self.last_loss)
+        self.OUT["logits"] = logits
+        self.OUT["last_loss"] = self.last_loss
+        if scale_ratio is not None:
+            self.OUT["output_scale_ratio"] = scale_ratio
         return self.OUT
 
     @torch.inference_mode()

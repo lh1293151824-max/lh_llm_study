@@ -1,11 +1,16 @@
 import argparse
+import shutil
 from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
 
 import config as cfg
-from k_model import ModelConfig, Transformer
+from k_model import (
+    ModelConfig,
+    Transformer,
+    validate_state_dict_output_head_type,
+)
 
 
 DEFAULT_SAVE_ROOT = cfg.EXPORT_SAVE_ROOT
@@ -86,6 +91,11 @@ def export_model_from_checkpoint(
 
     model = Transformer(config=model_config)
     state_dict = get_state_dict_from_checkpoint(checkpoint)
+    validate_state_dict_output_head_type(
+        state_dict,
+        expected=model_config.output_head_type,
+        context="export checkpoint",
+    )
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     model.eval()
 
@@ -96,6 +106,10 @@ def export_model_from_checkpoint(
     )
     model.save_pretrained(save_directory, safe_serialization=False)
     tokenizer.save_pretrained(save_directory)
+    shutil.copy2(
+        Path(__file__).with_name("deeponet.py"),
+        Path(save_directory) / "deeponet.py",
+    )
 
     print(
         f"Exported {stage} model: params={num_parameters / 1e6:.2f}M "

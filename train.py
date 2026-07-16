@@ -2,6 +2,7 @@ import datetime
 import math
 import os
 import random
+import warnings
 from types import SimpleNamespace
 
 import config as default_config
@@ -18,7 +19,12 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from dataset import PretrainDataset, SFTDataset
-from k_model import ModelConfig, Transformer
+from k_model import (
+    ModelConfig,
+    Transformer,
+    infer_output_head_type_from_state_dict,
+    validate_state_dict_output_head_type,
+)
 
 
 
@@ -48,6 +54,12 @@ def build_args_from_config(stage=None, mode=None):
         norm_eps=active_config["NORM_EPS"],
         dropout=active_config["DROPOUT"],
         multiple_of=active_config["MULTIPLE_OF"],
+        output_head_type=default_config.OUTPUT_HEAD_TYPE,
+        operator_rank=default_config.OPERATOR_RANK,
+        operator_alpha=default_config.OPERATOR_ALPHA,
+        operator_scale_warning_ratio=(
+            default_config.OPERATOR_SCALE_WARNING_RATIO
+        ),
         checkpoint_dir=active_config["CHECKPOINT_DIR"],
         checkpoint_prefix=active_config["CHECKPOINT_PREFIX"],
         checkpoint_path=active_config["CHECKPOINT_PATH"],
@@ -124,6 +136,10 @@ def build_model_config(vocab_size, args, pad_token_id=None):
         norm_eps=args.norm_eps,
         dropout=args.dropout,
         pad_token_id=pad_token_id,
+        output_head_type=args.output_head_type,
+        operator_rank=args.operator_rank,
+        operator_alpha=args.operator_alpha,
+        operator_scale_warning_ratio=args.operator_scale_warning_ratio,
     )
 
 
@@ -154,6 +170,7 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
 
     total_loss = 0.0
     total_batches = 0
+    max_output_scale_ratio = None
 
     with torch.no_grad():
         progress = tqdm(
@@ -170,6 +187,14 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 outputs = model(x, labels, attention_mask=attention_mask)
                 loss = outputs["last_loss"]
+                scale_ratio = outputs.get("output_scale_ratio")
+                if scale_ratio is not None:
+                    ratio_value = scale_ratio.item()
+                    max_output_scale_ratio = (
+                        ratio_value
+                        if max_output_scale_ratio is None
+                        else max(max_output_scale_ratio, ratio_value)
+                    )
                 loss_mask = loss_mask.view(-1)
                 valid_tokens = loss_mask.sum()
                 if valid_tokens.item() == 0:
@@ -183,38 +208,66 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
     if was_training:
         model.train()
 
+    if (
+        max_output_scale_ratio is not None
+        and max_output_scale_ratio
+        > model.config.operator_scale_warning_ratio
+    ):
+        warnings.warn(
+            "Linear and DeepONet logit RMS values differ by more than "
+            f"{model.config.operator_scale_warning_ratio:g}x "
+            f"(maximum observed ratio: {max_output_scale_ratio:.4g}x).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     if total_batches == 0:
         return None
     return total_loss / total_batches
 
 
-def save_checkpoint(model, optimizer, tokenizer, epoch, avg_loss, save_path, global_step, scaler, args, log_file=None):
+def _checkpoint_model_config(model):
+    config = model.config
+    return {
+        "vocab_size": config.vocab_size,
+        "max_seq_len": config.max_seq_len,
+        "dim": config.dim,
+        "n_layers": config.n_layers,
+        "n_heads": config.n_heads,
+        "n_kv_heads": config.n_kv_heads,
+        "hidden_dim": config.hidden_dim,
+        "multiple_of": config.multiple_of,
+        "norm_eps": config.norm_eps,
+        "dropout": config.dropout,
+        "pad_token_id": config.pad_token_id,
+        "output_head_type": config.output_head_type,
+        "operator_rank": config.operator_rank,
+        "operator_alpha": config.operator_alpha,
+        "operator_scale_warning_ratio": (
+            config.operator_scale_warning_ratio
+        ),
+    }
+
+
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    avg_loss,
+    save_path,
+    global_step,
+    scaler,
+    args,
+    log_file=None,
+):
     checkpoint = {
+        "format_version": 2,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "global_step": global_step,
         "train_stage": args.train_stage,
-        "data_path": args.data_path,
-        "model_config": {
-            "vocab_size": len(tokenizer),
-            "max_seq_len": args.max_seq_len,
-            "dim": args.dim,
-            "n_layers": args.n_layers,
-            "n_heads": args.n_heads,
-            "n_kv_heads": args.n_kv_heads,
-            "hidden_dim": None,
-            "multiple_of": args.multiple_of,
-            "norm_eps": args.norm_eps,
-            "dropout": args.dropout,
-            "pad_token_id": tokenizer.pad_token_id,
-        },
-        "vocab_size": len(tokenizer),
-        "max_seq_len": args.max_seq_len,
-        "dim_embedding": args.dim,
-        "n_heads": args.n_heads,
-        "n_kv_heads": args.n_kv_heads,
-        "n_layers": args.n_layers,
+        "model_config": _checkpoint_model_config(model),
         "tokenizer_name": args.tokenizer_path,
         "epoch": epoch,
         "avg_loss": avg_loss,
@@ -223,12 +276,47 @@ def save_checkpoint(model, optimizer, tokenizer, epoch, avg_loss, save_path, glo
     log_message(f"checkpoint saved: {save_path}", log_file)
 
 
+def _checkpoint_state_dict_and_mode(checkpoint):
+    state_dict = checkpoint.get("model_state_dict")
+    if isinstance(state_dict, dict):
+        model_config = checkpoint.get("model_config")
+        model_config = model_config if isinstance(model_config, dict) else {}
+        return state_dict, model_config.get("output_head_type", "linear")
+
+    if checkpoint and all(
+        isinstance(value, torch.Tensor) for value in checkpoint.values()
+    ):
+        return checkpoint, infer_output_head_type_from_state_dict(checkpoint)
+
+    raise KeyError('checkpoint missing a valid "model_state_dict"')
+
+
+def validate_checkpoint_output_head(checkpoint, model, context):
+    state_dict, checkpoint_mode = _checkpoint_state_dict_and_mode(checkpoint)
+    if checkpoint_mode != model.config.output_head_type:
+        raise ValueError(
+            f"{context} output head mismatch: checkpoint={checkpoint_mode}, "
+            f"model={model.config.output_head_type}"
+        )
+    validate_state_dict_output_head_type(
+        state_dict,
+        expected=checkpoint_mode,
+        context=context,
+    )
+    return state_dict
+
+
 def load_checkpoint_for_resume(checkpoint_path, model, optimizer, scaler, device, log_file=None):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = validate_checkpoint_output_head(
+        checkpoint,
+        model,
+        context="resume checkpoint",
+    )
+    model.load_state_dict(state_dict)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
@@ -369,6 +457,14 @@ def train(args):
     log_message(f"val_ratio: {args.val_ratio}", log_file)
     log_message(f"val_interval: {args.val_interval}", log_file)
     log_message(f"use_amp: {args.use_amp}", log_file)
+    log_message(f"output_head_type: {args.output_head_type}", log_file)
+    log_message(f"operator_rank: {args.operator_rank}", log_file)
+    log_message(f"operator_alpha: {args.operator_alpha}", log_file)
+    log_message(
+        "operator_scale_warning_ratio: "
+        f"{args.operator_scale_warning_ratio}",
+        log_file,
+    )
     assert args.dim % args.n_heads == 0, "dim must be divisible by n_heads"
     assert args.n_heads % args.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
 
@@ -400,7 +496,11 @@ def train(args):
                 map_location=device,
                 weights_only=False,
             )
-            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            state_dict = validate_checkpoint_output_head(
+                checkpoint,
+                model,
+                context="SFT initialization checkpoint",
+            )
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             log_message(f"sft init checkpoint: {sft_init_checkpoint_path}", log_file)
             if missing_keys:
@@ -537,7 +637,6 @@ def train(args):
                 save_checkpoint(
                     model=model,
                     optimizer=optimizer,
-                    tokenizer=tokenizer,
                     epoch=current_epoch,
                     avg_loss=loss.item(),
                     save_path=step_save_path,
@@ -581,7 +680,6 @@ def train(args):
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
-                tokenizer=tokenizer,
                 epoch=current_epoch,
                 avg_loss=avg_loss,
                 save_path=epoch_save_path,
@@ -595,7 +693,6 @@ def train(args):
     save_checkpoint(
         model=model,
         optimizer=optimizer,
-        tokenizer=tokenizer,
         epoch=args.epochs,
         avg_loss=avg_loss,
         save_path=final_save_path,
