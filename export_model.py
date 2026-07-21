@@ -9,6 +9,7 @@ import config as cfg
 from k_model import (
     ModelConfig,
     Transformer,
+    normalize_state_dict_keys,
     validate_state_dict_output_head_type,
 )
 
@@ -30,15 +31,6 @@ def format_parameter_count(num_parameters):
     return str(num_parameters)
 
 
-def clean_state_dict_prefix(state_dict, unwanted_prefix="_orig_mod."):
-    cleaned = {}
-    for key, value in state_dict.items():
-        if key.startswith(unwanted_prefix):
-            key = key[len(unwanted_prefix) :]
-        cleaned[key] = value
-    return cleaned
-
-
 def load_checkpoint(checkpoint_path):
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
@@ -57,7 +49,35 @@ def get_state_dict_from_checkpoint(checkpoint):
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     if not isinstance(state_dict, dict):
         raise TypeError("checkpoint model state_dict must be a dict")
-    return clean_state_dict_prefix(state_dict)
+    return normalize_state_dict_keys(state_dict)
+
+
+def validate_tokenizer_compatibility(tokenizer, checkpoint, model_config):
+    tokenizer_config = checkpoint.get("tokenizer_config")
+    expected = tokenizer_config if isinstance(tokenizer_config, dict) else {}
+    expected_vocab_size = expected.get("vocab_size", model_config.vocab_size)
+    if len(tokenizer) != expected_vocab_size:
+        raise ValueError(
+            "export tokenizer vocab mismatch: "
+            f"checkpoint={expected_vocab_size}, tokenizer={len(tokenizer)}"
+        )
+
+    token_id_names = (
+        "pad_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "unk_token_id",
+    )
+    for name in token_id_names:
+        expected_id = expected.get(name)
+        if name == "pad_token_id" and expected_id is None:
+            expected_id = model_config.pad_token_id
+        actual_id = getattr(tokenizer, name)
+        if expected_id is not None and actual_id != expected_id:
+            raise ValueError(
+                f"export tokenizer {name} mismatch: "
+                f"checkpoint={expected_id}, tokenizer={actual_id}"
+            )
 
 
 def infer_export_stage(checkpoint, fallback_stage=None):
@@ -86,6 +106,7 @@ def export_model_from_checkpoint(
         trust_remote_code=True,
     )
     tokenizer.padding_side = "left"
+    validate_tokenizer_compatibility(tokenizer, checkpoint, model_config)
     if tokenizer.pad_token_id is not None:
         model_config.pad_token_id = tokenizer.pad_token_id
 
@@ -96,7 +117,7 @@ def export_model_from_checkpoint(
         expected=model_config.output_head_type,
         context="export checkpoint",
     )
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     num_parameters = count_parameters(model)
@@ -115,11 +136,6 @@ def export_model_from_checkpoint(
         f"Exported {stage} model: params={num_parameters / 1e6:.2f}M "
         f"({num_parameters / 1e9:.2f}B), output={save_directory}"
     )
-    if missing_keys:
-        print(f"Warning: export missing_keys={missing_keys}")
-    if unexpected_keys:
-        print(f"Warning: export unexpected_keys={unexpected_keys}")
-
     return save_directory
 
 

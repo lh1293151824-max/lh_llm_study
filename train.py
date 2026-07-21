@@ -23,9 +23,27 @@ from k_model import (
     ModelConfig,
     Transformer,
     infer_output_head_type_from_state_dict,
+    normalize_state_dict_keys,
     validate_state_dict_output_head_type,
 )
 
+def get_lr(step, total_steps, args):
+
+    min_lr = args.learning_rate * 0.1
+
+    if args.warmup_iters > 0 and step < args.warmup_iters:
+        return args.learning_rate * step / args.warmup_iters
+
+    if step > total_steps:
+        return min_lr
+
+    if total_steps == args.warmup_iters:
+        return min_lr
+
+    decay_ratio = (step - args.warmup_iters) / (total_steps - args.warmup_iters)
+    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (args.learning_rate - min_lr)
 
 
 
@@ -105,22 +123,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_lr(step, total_steps, args):
-    min_lr = args.learning_rate * 0.1
 
-    if args.warmup_iters > 0 and step < args.warmup_iters:
-        return args.learning_rate * step / args.warmup_iters
-
-    if step > total_steps:
-        return min_lr
-
-    if total_steps == args.warmup_iters:
-        return min_lr
-
-    decay_ratio = (step - args.warmup_iters) / (total_steps - args.warmup_iters)
-    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (args.learning_rate - min_lr)
 
 
 def build_model_config(vocab_size, args, pad_token_id=None):
@@ -249,6 +252,16 @@ def _checkpoint_model_config(model):
     }
 
 
+def _tokenizer_metadata(tokenizer):
+    return {
+        "vocab_size": len(tokenizer),
+        "pad_token_id": tokenizer.pad_token_id,
+        "bos_token_id": tokenizer.bos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "unk_token_id": tokenizer.unk_token_id,
+    }
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -269,6 +282,7 @@ def save_checkpoint(
         "train_stage": args.train_stage,
         "model_config": _checkpoint_model_config(model),
         "tokenizer_name": args.tokenizer_path,
+        "tokenizer_config": args.tokenizer_metadata,
         "epoch": epoch,
         "avg_loss": avg_loss,
     }
@@ -279,6 +293,7 @@ def save_checkpoint(
 def _checkpoint_state_dict_and_mode(checkpoint):
     state_dict = checkpoint.get("model_state_dict")
     if isinstance(state_dict, dict):
+        state_dict = normalize_state_dict_keys(state_dict)
         model_config = checkpoint.get("model_config")
         model_config = model_config if isinstance(model_config, dict) else {}
         return state_dict, model_config.get("output_head_type", "linear")
@@ -286,7 +301,8 @@ def _checkpoint_state_dict_and_mode(checkpoint):
     if checkpoint and all(
         isinstance(value, torch.Tensor) for value in checkpoint.values()
     ):
-        return checkpoint, infer_output_head_type_from_state_dict(checkpoint)
+        state_dict = normalize_state_dict_keys(checkpoint)
+        return state_dict, infer_output_head_type_from_state_dict(state_dict)
 
     raise KeyError('checkpoint missing a valid "model_state_dict"')
 
@@ -368,15 +384,14 @@ def resolve_sft_init_checkpoint_path(args):
     return find_latest_checkpoint(pretrain_config["CHECKPOINT_DIR"], "pretrain")
 
 
-def train(args):
-    args.checkpoint_prefix = ensure_stage_checkpoint_name(
-        args.checkpoint_prefix,
-        args.train_stage,
-    )
-    args.checkpoint_path = ensure_stage_checkpoint_name(
-        args.checkpoint_path,
-        args.train_stage,
-    )
+def prepare_training(args):
+    for attribute in ("checkpoint_prefix", "checkpoint_path"):
+        filename = getattr(args, attribute)
+        filename = ensure_stage_checkpoint_name(
+            filename,
+            args.train_stage,
+        )
+        setattr(args, attribute, filename)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -386,7 +401,11 @@ def train(args):
     writer = SummaryWriter(log_dir=args.log_dir)
 
     log_message("=" * 80, log_file)
-    log_message(f"start_time: {datetime.datetime.now().isoformat(timespec='seconds')}", log_file)
+    log_message(
+        "start_time: "
+        f"{datetime.datetime.now().isoformat(timespec='seconds')}",
+        log_file,
+    )
     log_message(f"train_stage: {args.train_stage}", log_file)
     log_message(f"data_path: {args.data_path}", log_file)
     log_message(f"tokenizer_path: {args.tokenizer_path}", log_file)
@@ -400,10 +419,17 @@ def train(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     tokenizer.padding_side = "left"
+    args.tokenizer_metadata = _tokenizer_metadata(tokenizer)
 
     if not os.path.exists(args.data_path):
-        raise FileNotFoundError(f"training data not found: {args.data_path}")
+        raise FileNotFoundError(
+            f"training data not found: {args.data_path}"
+        )
 
+    return device, tokenizer, log_file, writer
+
+
+def init_model(args, tokenizer, device, log_file):
     if args.train_stage == "pretrain":
         dataset = PretrainDataset(
             data_path=args.data_path,
@@ -445,14 +471,25 @@ def train(args):
 
     log_message(f"samples: {len(dataset)}", log_file)
     log_message(f"train_samples: {len(train_dataset)}", log_file)
-    log_message(f"val_samples: {len(val_dataset) if val_dataset is not None else 0}", log_file)
+    log_message(
+        "val_samples: "
+        f"{len(val_dataset) if val_dataset is not None else 0}",
+        log_file,
+    )
     log_message(f"train_batches: {len(train_loader)}", log_file)
-    log_message(f"val_batches: {len(val_loader) if val_loader is not None else 0}", log_file)
+    log_message(
+        "val_batches: "
+        f"{len(val_loader) if val_loader is not None else 0}",
+        log_file,
+    )
     log_message(f"batch_size: {args.batch_size}", log_file)
     log_message(f"max_seq_len: {args.max_seq_len}", log_file)
     log_message(f"epochs: {args.epochs}", log_file)
     log_message(f"learning_rate: {args.learning_rate}", log_file)
-    log_message(f"accumulation_steps: {args.accumulation_steps}", log_file)
+    log_message(
+        f"accumulation_steps: {args.accumulation_steps}",
+        log_file,
+    )
     log_message(f"warmup_iters: {args.warmup_iters}", log_file)
     log_message(f"val_ratio: {args.val_ratio}", log_file)
     log_message(f"val_interval: {args.val_interval}", log_file)
@@ -465,8 +502,12 @@ def train(args):
         f"{args.operator_scale_warning_ratio}",
         log_file,
     )
-    assert args.dim % args.n_heads == 0, "dim must be divisible by n_heads"
-    assert args.n_heads % args.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+    assert args.dim % args.n_heads == 0, (
+        "dim must be divisible by n_heads"
+    )
+    assert args.n_heads % args.n_kv_heads == 0, (
+        "n_heads must be divisible by n_kv_heads"
+    )
 
     model_config = build_model_config(
         vocab_size=len(tokenizer),
@@ -475,10 +516,19 @@ def train(args):
     )
     model = Transformer(config=model_config).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(
+        parameter.numel() for parameter in model.parameters()
+    )
+    trainable_params = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
     log_message(f"total_params: {total_params / 1e9:.6f} B", log_file)
-    log_message(f"trainable_params: {trainable_params / 1e9:.6f} B", log_file)
+    log_message(
+        f"trainable_params: {trainable_params / 1e9:.6f} B",
+        log_file,
+    )
 
     if args.train_stage == "sft" and not args.resume:
         try:
@@ -489,7 +539,8 @@ def train(args):
         if sft_init_checkpoint_path:
             if not os.path.exists(sft_init_checkpoint_path):
                 raise FileNotFoundError(
-                    f"sft init checkpoint not found: {sft_init_checkpoint_path}"
+                    "sft init checkpoint not found: "
+                    f"{sft_init_checkpoint_path}"
                 )
             checkpoint = torch.load(
                 sft_init_checkpoint_path,
@@ -501,20 +552,26 @@ def train(args):
                 model,
                 context="SFT initialization checkpoint",
             )
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            log_message(f"sft init checkpoint: {sft_init_checkpoint_path}", log_file)
-            if missing_keys:
-                log_message(f"sft init missing_keys: {missing_keys}", log_file)
-            if unexpected_keys:
-                log_message(f"sft init unexpected_keys: {unexpected_keys}", log_file)
+            model.load_state_dict(state_dict, strict=True)
+            log_message(
+                f"sft init checkpoint: {sft_init_checkpoint_path}",
+                log_file,
+            )
         else:
             log_message(
-                "未设置 SFT 预训练权重文件，当前将随机初始化模型并用 SFT 数据从零训练。",
+                "未设置 SFT 预训练权重文件，"
+                "当前将随机初始化模型并用 SFT 数据从零训练。",
                 log_file,
             )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    scaler = GradScaler("cuda", enabled=args.use_amp and device.type == "cuda")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+    )
+    scaler = GradScaler(
+        "cuda",
+        enabled=args.use_amp and device.type == "cuda",
+    )
 
     start_epoch = 0
     global_step = 0
@@ -529,7 +586,36 @@ def train(args):
             device=device,
             log_file=log_file,
         )
+
     model.train()
+    return (
+        model,
+        optimizer,
+        scaler,
+        start_epoch,
+        global_step,
+        train_loader,
+        val_loader,
+    )
+
+
+def train(args):
+    device, tokenizer, log_file, writer = prepare_training(args)
+    (
+        model,
+        optimizer,
+        scaler,
+        start_epoch,
+        global_step,
+        train_loader,
+        val_loader,
+    ) = init_model(
+        args=args,
+        tokenizer=tokenizer,
+        device=device,
+        log_file=log_file,
+    )
+
     if args.accumulation_steps <= 0:
         raise ValueError("accumulation_steps must be greater than 0")
     total_steps = args.epochs * len(train_loader)
@@ -548,7 +634,7 @@ def train(args):
             desc=f"{stage_label} epoch={current_epoch}/{args.epochs}",
         )
 
-        for step, (x, labels, loss_mask, attention_mask) in enumerate(pbar):
+        for x, labels, loss_mask, attention_mask in pbar:
             x = x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             loss_mask = loss_mask.to(device, non_blocking=True)

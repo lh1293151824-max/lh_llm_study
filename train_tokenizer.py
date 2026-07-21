@@ -134,12 +134,8 @@ def eval_tokenizer(tokenizer_path: str = None) -> None:
     """Evaluate tokenizer loading, chat template, and special token handling."""
     tokenizer_path = tokenizer_path or cfg.TOKENIZER_SAVE_DIR
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        tokenizer.padding_side = "left"
-    except Exception as exc:
-        print(f"Error loading tokenizer: {exc}")
-        return
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer.padding_side = "left"
 
     print("\n=== Tokenizer basic info ===")
     print(f"Vocab size: {len(tokenizer)}")
@@ -161,7 +157,9 @@ def eval_tokenizer(tokenizer_path: str = None) -> None:
     print("\n=== Encode and decode test ===")
     encoded = tokenizer(prompt, truncation=True, max_length=256)
     decoded = tokenizer.decode(encoded["input_ids"], skip_special_tokens=False)
-    print("Decoded text matches original:", decoded == prompt)
+    if decoded != prompt:
+        raise ValueError("tokenizer encode/decode evaluation failed")
+    print("Decoded text matches original: True")
 
     print("\n=== Special token test ===")
     test_text = "<|im_start|>user\nHello<|im_end|>"
@@ -169,7 +167,9 @@ def eval_tokenizer(tokenizer_path: str = None) -> None:
     decoded = tokenizer.decode(encoded)
     print(f"Original: {test_text}")
     print(f"Decoded:  {decoded}")
-    print("Special tokens preserved:", decoded == test_text)
+    if decoded != test_text:
+        raise ValueError("tokenizer special-token preservation evaluation failed")
+    print("Special tokens preserved: True")
 
 
 def main():

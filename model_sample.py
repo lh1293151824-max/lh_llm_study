@@ -8,7 +8,7 @@ import config as cfg
 from k_model import (
     ModelConfig,
     Transformer,
-    infer_output_head_type_from_state_dict,
+    normalize_state_dict_keys,
     validate_state_dict_output_head_type,
 )
 
@@ -54,8 +54,8 @@ class TextGenerator:
         self.checkpoint = checkpoint or self.find_latest_checkpoint(self.stage)
         checkpoint_data = torch.load(
             self.checkpoint,
-            map_location=self.device,
-            weights_only=False,
+            map_location="cpu",
+            weights_only=True,
         )
         if not isinstance(checkpoint_data, dict):
             raise TypeError("checkpoint must contain a dictionary")
@@ -77,22 +77,22 @@ class TextGenerator:
         self.tokenizer.padding_side = "left"
 
         model_config = self._build_model_config(checkpoint_data)
+        self._validate_tokenizer(checkpoint_data, model_config)
         if self.tokenizer.pad_token_id is not None:
             model_config.pad_token_id = self.tokenizer.pad_token_id
 
-        self.model = Transformer(config=model_config).to(self.device)
         state_dict = self._extract_state_dict(checkpoint_data)
-        state_dict = self._clean_state_dict_prefix(state_dict)
+        state_dict = normalize_state_dict_keys(state_dict)
         validate_state_dict_output_head_type(
             state_dict,
             expected=model_config.output_head_type,
             context="sampling checkpoint",
         )
-        missing_keys, unexpected_keys = self.model.load_state_dict(
-            state_dict,
-            strict=False,
-        )
+        self.model = Transformer(config=model_config)
+        self.model.load_state_dict(state_dict, strict=True)
+        self.model.to(self.device)
         self.model.eval()
+        del state_dict, checkpoint_data
 
         num_params = sum(
             parameter.numel()
@@ -104,10 +104,6 @@ class TextGenerator:
             f"checkpoint={self.checkpoint}"
         )
         print(f"Model has {num_params / 1e6:.3f} M parameters.")
-        if missing_keys:
-            print(f"Warning: missing_keys={missing_keys}")
-        if unexpected_keys:
-            print(f"Warning: unexpected_keys={unexpected_keys}")
 
     def _set_seed(self):
         torch.manual_seed(self.seed)
@@ -168,7 +164,10 @@ class TextGenerator:
         if checkpoint_data and all(
             isinstance(value, torch.Tensor) for value in checkpoint_data.values()
         ):
-            return self._build_model_config_from_state_dict(checkpoint_data)
+            raise ValueError(
+                "raw state_dict checkpoints are unsupported; use a checkpoint "
+                "containing model_config and model_state_dict"
+            )
 
         required_keys = {
             "vocab_size",
@@ -195,86 +194,39 @@ class TextGenerator:
             ),
         )
 
-    def _build_model_config_from_state_dict(self, state_dict):
-        state_dict = self._clean_state_dict_prefix(state_dict)
-        embedding_weight = state_dict.get("tok_embeddings.weight")
-        if embedding_weight is None or embedding_weight.dim() != 2:
-            raise KeyError(
-                'raw state_dict missing valid "tok_embeddings.weight"'
-            )
-
-        vocab_size, dim = embedding_weight.shape
-        layer_indices = []
-        for key in state_dict:
-            if not key.startswith("layers."):
-                continue
-            parts = key.split(".")
-            if len(parts) > 1 and parts[1].isdigit():
-                layer_indices.append(int(parts[1]))
-
-        # Raw legacy state_dict files do not record the attention head layout.
-        # They correspond to the original full training architecture.
-        active_config = cfg.get_active_config(stage=self.stage, mode="train")
-        n_layers = (
-            max(layer_indices) + 1
-            if layer_indices
-            else active_config["N_LAYERS"]
-        )
-        hidden_weight = state_dict.get("layers.0.feed_forward.w1.weight")
-        hidden_dim = (
-            hidden_weight.size(0)
-            if isinstance(hidden_weight, torch.Tensor)
-            else None
-        )
-        output_head_type = infer_output_head_type_from_state_dict(state_dict)
-        operator_weight = state_dict.get(
-            "operator_output.branch_output.weight"
-        )
-        operator_rank = (
-            operator_weight.size(0)
-            if isinstance(operator_weight, torch.Tensor)
-            and operator_weight.dim() == 2
-            else cfg.OPERATOR_RANK
-        )
-
-        return ModelConfig(
-            vocab_size=vocab_size,
-            max_seq_len=active_config["MAX_SEQ_LEN"],
-            dim=dim,
-            n_layers=n_layers,
-            n_heads=active_config["N_HEADS"],
-            n_kv_heads=active_config["N_KV_HEADS"],
-            hidden_dim=hidden_dim,
-            multiple_of=active_config["MULTIPLE_OF"],
-            norm_eps=active_config["NORM_EPS"],
-            dropout=active_config["DROPOUT"],
-            output_head_type=output_head_type,
-            operator_rank=operator_rank,
-            operator_alpha=cfg.OPERATOR_ALPHA,
-            operator_scale_warning_ratio=(
-                cfg.OPERATOR_SCALE_WARNING_RATIO
-            ),
-        )
-
     @staticmethod
     def _extract_state_dict(checkpoint_data):
         state_dict = checkpoint_data.get("model_state_dict")
         if isinstance(state_dict, dict):
             return state_dict
-        if checkpoint_data and all(
-            isinstance(value, torch.Tensor) for value in checkpoint_data.values()
-        ):
-            return checkpoint_data
         raise KeyError('checkpoint missing a valid "model_state_dict"')
 
-    @staticmethod
-    def _clean_state_dict_prefix(state_dict, unwanted_prefix="_orig_mod."):
-        cleaned_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith(unwanted_prefix):
-                key = key[len(unwanted_prefix) :]
-            cleaned_state_dict[key] = value
-        return cleaned_state_dict
+    def _validate_tokenizer(self, checkpoint_data, model_config):
+        tokenizer = checkpoint_data.get("tokenizer_config")
+        expected = tokenizer if isinstance(tokenizer, dict) else {}
+        expected_vocab_size = expected.get("vocab_size", model_config.vocab_size)
+        if len(self.tokenizer) != expected_vocab_size:
+            raise ValueError(
+                "sampling tokenizer vocab mismatch: "
+                f"checkpoint={expected_vocab_size}, tokenizer={len(self.tokenizer)}"
+            )
+
+        token_id_names = (
+            "pad_token_id",
+            "bos_token_id",
+            "eos_token_id",
+            "unk_token_id",
+        )
+        for name in token_id_names:
+            expected_id = expected.get(name)
+            if name == "pad_token_id" and expected_id is None:
+                expected_id = model_config.pad_token_id
+            actual_id = getattr(self.tokenizer, name)
+            if expected_id is not None and actual_id != expected_id:
+                raise ValueError(
+                    f"sampling tokenizer {name} mismatch: "
+                    f"checkpoint={expected_id}, tokenizer={actual_id}"
+                )
 
     def _build_prompt(self, start, stage):
         if stage == "sft":

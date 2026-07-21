@@ -14,6 +14,27 @@ except ImportError:
 OUTPUT_HEAD_TYPES = frozenset({"linear", "deeponet", "hybrid"})
 
 
+def normalize_state_dict_keys(state_dict, unwanted_prefix="_orig_mod."):
+    """Remove a compile wrapper prefix without silently overwriting keys."""
+    if not isinstance(state_dict, dict):
+        raise TypeError("state_dict must be a dictionary")
+
+    normalized = {}
+    for key, value in state_dict.items():
+        normalized_key = (
+            key[len(unwanted_prefix) :]
+            if key.startswith(unwanted_prefix)
+            else key
+        )
+        if normalized_key in normalized:
+            raise KeyError(
+                "duplicate state_dict key after normalization: "
+                f"{normalized_key}"
+            )
+        normalized[normalized_key] = value
+    return normalized
+
+
 class ModelConfig(PretrainedConfig):
     model_type = "tiny-k"
 
@@ -90,10 +111,7 @@ def infer_output_head_type_from_state_dict(state_dict):
     if not isinstance(state_dict, dict):
         raise TypeError("state_dict must be a dictionary")
 
-    keys = {
-        key[len("_orig_mod.") :] if key.startswith("_orig_mod.") else key
-        for key in state_dict
-    }
+    keys = normalize_state_dict_keys(state_dict).keys()
     has_operator = any(key.startswith("operator_output.") for key in keys)
     has_linear = "output.weight" in keys
     if has_operator:
@@ -208,8 +226,6 @@ class Attention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = dim_embedding // n_heads
         self.n_rep = n_heads // n_kv_heads
-        self.dropout = dropout
-
         self.wq = nn.Linear(dim_embedding, n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(dim_embedding, n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(dim_embedding, n_kv_heads * self.head_dim, bias=False)
@@ -404,10 +420,6 @@ class Transformer(PreTrainedModel):
         self.multiple_of = config.multiple_of
         self.output_head_type = config.output_head_type
         self.operator_alpha = config.operator_alpha
-        self.operator_scale_warning_ratio = (
-            config.operator_scale_warning_ratio
-        )
-
         assert self.dim % self.n_heads == 0, "dim must be divisible by n_heads"
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
 

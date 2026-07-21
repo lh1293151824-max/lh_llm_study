@@ -10,6 +10,13 @@ from train_tokenizer import eval_tokenizer, train_tokenizer
 
 
 DOC_BUILD_STAGE = "build_pretrain_original_from_docs"
+PRETRAIN_DATA_STAGES = {
+    DOC_BUILD_STAGE,
+    "tokenizer",
+    "tokenizer_eval",
+    "data_prep",
+    "pretrain",
+}
 
 
 def copy_text_jsonl(source_path, output_path):
@@ -139,7 +146,8 @@ def main():
     start_index = pipeline_stages.index(start_stage)
     selected_stages = pipeline_stages[start_index:]
 
-    ensure_pretrain_original_data(selected_stages)
+    if any(stage in PRETRAIN_DATA_STAGES for stage in selected_stages):
+        ensure_pretrain_original_data(selected_stages)
 
     for stage in selected_stages:
         run_stage(stage)

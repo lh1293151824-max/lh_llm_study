@@ -214,10 +214,6 @@ TRAIN_CONFIG = {
     "LOG_INTERVAL": 100,
     "SAVE_EVERY_STEPS": 20000,
     "SAVE_EVERY_EPOCHS": 1,
-    "MAX_NEW_TOKENS": 512,
-    "TEMPERATURE": 1.0,
-    "TOP_K": 1,
-    "STREAM": True,  # Options: True, False
 }
 
 TEST_CONFIG = {
@@ -235,10 +231,6 @@ TEST_CONFIG = {
     "LOG_INTERVAL": 5,
     "SAVE_EVERY_STEPS": 20,
     "SAVE_EVERY_EPOCHS": 1,
-    "MAX_NEW_TOKENS": 64,
-    "TEMPERATURE": 0.9,
-    "TOP_K": 1,
-    "STREAM": True,  # Options: True, False
 }
 
 
