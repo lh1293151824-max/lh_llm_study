@@ -13,6 +13,11 @@ CONFIG_MODE = "test"
 # False: start from TRAIN_STAGE and continue through the remaining pipeline stages.
 RUN_FULL_PIPELINE = True
 
+# Options: "linear", "deeponet", "hybrid"
+
+OUTPUT_HEAD_TYPE = "deeponet"
+#=====================================================
+
 # Options when RUN_FULL_PIPELINE is False:
 # "build_pretrain_original_from_docs", "data_prep", "tokenizer",
 # "tokenizer_eval", "pretrain", "sft"
@@ -156,11 +161,11 @@ SYSTEM_PROMPT = "你是一个AI助手"
 # DeepONet output configs
 # =============================================================================
 
-# Options: "linear", "deeponet", "hybrid"
-OUTPUT_HEAD_TYPE = "hybrid"
+
+
 
 # Shared Branch/Trunk feature dimension used by the DeepONet output head.
-OPERATOR_RANK = 1024
+OPERATOR_RANK = 256*2
 
 # DeepONet contribution in hybrid mode; Linear contribution is 1 - alpha.
 OPERATOR_ALPHA = 0.9
@@ -198,6 +203,14 @@ MODEL_TEST_CONFIG = {
 # =============================================================================
 # Runtime and training configs
 # =============================================================================
+
+# Basic single-process multi-GPU training. When disabled, the configured
+# device list is ignored and training keeps the normal CUDA/CPU selection.
+USE_DATA_PARALLEL = False
+
+# None uses all currently visible CUDA devices when DataParallel is enabled.
+# Otherwise provide visible-device indices such as [0, 1].
+DATA_PARALLEL_DEVICE_IDS = None
 
 TRAIN_CONFIG = {
     "SEED": 42,

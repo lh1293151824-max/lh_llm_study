@@ -65,6 +65,8 @@ def build_args_from_config(stage=None, mode=None):
         grad_clip=active_config["GRAD_CLIP"],
         use_amp=active_config["USE_AMP"],
         num_workers=active_config["NUM_WORKERS"],
+        use_data_parallel=default_config.USE_DATA_PARALLEL,
+        data_parallel_device_ids=default_config.DATA_PARALLEL_DEVICE_IDS,
         dim=active_config["DIM_EMBEDDING"],
         n_layers=active_config["N_LAYERS"],
         n_heads=active_config["N_HEADS"],
@@ -124,6 +126,109 @@ def set_seed(seed):
 
 
 
+
+
+def unwrap_model(model):
+    current = model
+    visited = set()
+
+    while True:
+        current_id = id(current)
+        if current_id in visited:
+            raise RuntimeError("cyclic model wrapper chain detected")
+        visited.add(current_id)
+
+        if isinstance(current, torch.nn.DataParallel):
+            current = current.module
+            continue
+
+        original_model = getattr(current, "_orig_mod", None)
+        if original_model is not None:
+            current = original_model
+            continue
+
+        return current
+
+
+def resolve_training_device(args):
+    if not torch.cuda.is_available():
+        args.resolved_data_parallel_device_ids = []
+        return torch.device("cpu")
+
+    if not args.use_data_parallel:
+        args.resolved_data_parallel_device_ids = []
+        return torch.device("cuda")
+
+    available_count = torch.cuda.device_count()
+    configured_ids = args.data_parallel_device_ids
+    if configured_ids is None:
+        device_ids = list(range(available_count))
+    else:
+        if not isinstance(configured_ids, (list, tuple)) or not configured_ids:
+            raise ValueError(
+                "DATA_PARALLEL_DEVICE_IDS must be a non-empty list or tuple"
+            )
+        if any(
+            not isinstance(device_id, int) or isinstance(device_id, bool)
+            for device_id in configured_ids
+        ):
+            raise TypeError("DataParallel device IDs must be integers")
+        device_ids = list(configured_ids)
+        if len(set(device_ids)) != len(device_ids):
+            raise ValueError("DataParallel device IDs must be unique")
+        invalid_ids = [
+            device_id
+            for device_id in device_ids
+            if device_id < 0 or device_id >= available_count
+        ]
+        if invalid_ids:
+            raise ValueError(
+                "DataParallel device IDs out of range: "
+                f"{invalid_ids}; visible CUDA device count={available_count}"
+            )
+
+    args.resolved_data_parallel_device_ids = device_ids
+    return torch.device(f"cuda:{device_ids[0]}")
+
+
+def maybe_wrap_data_parallel(model, args, device, log_file=None):
+    if device.type != "cuda":
+        log_message("DataParallel disabled: CUDA is unavailable", log_file)
+        return model
+    if not args.use_data_parallel:
+        log_message("DataParallel disabled by configuration", log_file)
+        return model
+
+    device_ids = args.resolved_data_parallel_device_ids
+    if len(device_ids) <= 1:
+        log_message(
+            "DataParallel not enabled: fewer than two selected CUDA devices",
+            log_file,
+        )
+        return model
+
+    primary_device = torch.device(f"cuda:{device_ids[0]}")
+    for parameter in model.parameters():
+        if parameter.device != primary_device:
+            raise RuntimeError(
+                "all model parameters must be on the DataParallel primary device"
+            )
+    for buffer in model.buffers():
+        if buffer.device != primary_device:
+            raise RuntimeError(
+                "all model buffers must be on the DataParallel primary device"
+            )
+
+    log_message(
+        f"DataParallel enabled: device_ids={device_ids}, "
+        f"output_device={device_ids[0]}",
+        log_file,
+    )
+    return torch.nn.DataParallel(
+        model,
+        device_ids=device_ids,
+        output_device=device_ids[0],
+    )
 
 
 def build_model_config(vocab_size, args, pad_token_id=None):
@@ -189,20 +294,24 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
 
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 outputs = model(x, labels, attention_mask=attention_mask)
-                loss = outputs["last_loss"]
+                token_loss = outputs["last_loss"].view(-1)
+                flat_loss_mask = loss_mask.view(-1)
+                if token_loss.numel() != flat_loss_mask.numel():
+                    raise RuntimeError(
+                        "gathered token loss size does not match loss mask size"
+                    )
                 scale_ratio = outputs.get("output_scale_ratio")
                 if scale_ratio is not None:
-                    ratio_value = scale_ratio.item()
+                    ratio_value = scale_ratio.detach().max().item()
                     max_output_scale_ratio = (
                         ratio_value
                         if max_output_scale_ratio is None
                         else max(max_output_scale_ratio, ratio_value)
                     )
-                loss_mask = loss_mask.view(-1)
-                valid_tokens = loss_mask.sum()
+                valid_tokens = flat_loss_mask.sum()
                 if valid_tokens.item() == 0:
                     continue
-                loss = torch.sum(loss * loss_mask) / valid_tokens
+                loss = torch.sum(token_loss * flat_loss_mask) / valid_tokens
 
             total_loss += loss.item()
             total_batches += 1
@@ -211,14 +320,16 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
     if was_training:
         model.train()
 
+    warning_ratio = unwrap_model(
+        model
+    ).config.operator_scale_warning_ratio
     if (
         max_output_scale_ratio is not None
-        and max_output_scale_ratio
-        > model.config.operator_scale_warning_ratio
+        and max_output_scale_ratio > warning_ratio
     ):
         warnings.warn(
             "Linear and DeepONet logit RMS values differ by more than "
-            f"{model.config.operator_scale_warning_ratio:g}x "
+            f"{warning_ratio:g}x "
             f"(maximum observed ratio: {max_output_scale_ratio:.4g}x).",
             RuntimeWarning,
             stacklevel=2,
@@ -230,7 +341,7 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
 
 
 def _checkpoint_model_config(model):
-    config = model.config
+    config = unwrap_model(model).config
     return {
         "vocab_size": config.vocab_size,
         "max_seq_len": config.max_seq_len,
@@ -273,9 +384,10 @@ def save_checkpoint(
     args,
     log_file=None,
 ):
+    base_model = unwrap_model(model)
     checkpoint = {
         "format_version": 2,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": base_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "global_step": global_step,
@@ -309,10 +421,11 @@ def _checkpoint_state_dict_and_mode(checkpoint):
 
 def validate_checkpoint_output_head(checkpoint, model, context):
     state_dict, checkpoint_mode = _checkpoint_state_dict_and_mode(checkpoint)
-    if checkpoint_mode != model.config.output_head_type:
+    base_model = unwrap_model(model)
+    if checkpoint_mode != base_model.config.output_head_type:
         raise ValueError(
             f"{context} output head mismatch: checkpoint={checkpoint_mode}, "
-            f"model={model.config.output_head_type}"
+            f"model={base_model.config.output_head_type}"
         )
     validate_state_dict_output_head_type(
         state_dict,
@@ -332,7 +445,7 @@ def load_checkpoint_for_resume(checkpoint_path, model, optimizer, scaler, device
         model,
         context="resume checkpoint",
     )
-    model.load_state_dict(state_dict)
+    unwrap_model(model).load_state_dict(state_dict)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
@@ -414,8 +527,16 @@ def prepare_training(args):
 
     set_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_training_device(args)
     log_message(f"device: {device}", log_file)
+    log_message(f"cuda_device_count: {torch.cuda.device_count()}", log_file)
+    log_message(f"use_data_parallel: {args.use_data_parallel}", log_file)
+    if args.use_data_parallel:
+        log_message(
+            "data_parallel_device_ids: "
+            f"{args.resolved_data_parallel_device_ids}",
+            log_file,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     tokenizer.padding_side = "left"
@@ -587,6 +708,12 @@ def init_model(args, tokenizer, device, log_file):
             log_file=log_file,
         )
 
+    model = maybe_wrap_data_parallel(
+        model,
+        args=args,
+        device=device,
+        log_file=log_file,
+    )
     model.train()
     return (
         model,
@@ -620,7 +747,10 @@ def train(args):
         raise ValueError("accumulation_steps must be greater than 0")
     total_steps = args.epochs * len(train_loader)
     avg_loss = 0.0
-    stage_label = f"[{args.train_stage}]"
+    stage_label = (
+        f"[{args.output_head_type}]"
+        f"[{args.train_stage}]"
+    )
     last_step_checkpoint = global_step
 
     for epoch in range(start_epoch, args.epochs):
@@ -646,12 +776,16 @@ def train(args):
 
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 outputs = model(x, labels, attention_mask=attention_mask)
-                loss = outputs["last_loss"]
-                loss_mask = loss_mask.view(-1)
-                valid_tokens = loss_mask.sum()
+                token_loss = outputs["last_loss"].view(-1)
+                flat_loss_mask = loss_mask.view(-1)
+                if token_loss.numel() != flat_loss_mask.numel():
+                    raise RuntimeError(
+                        "gathered token loss size does not match loss mask size"
+                    )
+                valid_tokens = flat_loss_mask.sum()
                 if valid_tokens.item() == 0:
                     continue
-                loss = torch.sum(loss * loss_mask) / valid_tokens
+                loss = torch.sum(token_loss * flat_loss_mask) / valid_tokens
 
             scaler.scale(loss).backward()
             accumulated_batches += 1

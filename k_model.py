@@ -383,7 +383,9 @@ class DecoderLayer(nn.Module):
 
 class Transformer(PreTrainedModel):
     config_class = ModelConfig
-    _tied_weights_keys = ["output.weight"]
+    _tied_weights_keys = {
+        "output.weight": "tok_embeddings.weight",
+    }
 
     def __init__(
         self,
@@ -406,7 +408,6 @@ class Transformer(PreTrainedModel):
 
         super().__init__(config)
         self.config = config
-        self.OUT = {}
         self.vocab_size = config.vocab_size
         self.max_seq_len = config.max_seq_len
         self.dim = config.dim
@@ -474,9 +475,11 @@ class Transformer(PreTrainedModel):
 
         if self.output is not None:
             self.output.weight = self.tok_embeddings.weight
-            self._tied_weights_keys = ["output.weight"]
+            self._tied_weights_keys = {
+                "output.weight": "tok_embeddings.weight",
+            }
         else:
-            self._tied_weights_keys = []
+            self._tied_weights_keys = {}
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -519,7 +522,26 @@ class Transformer(PreTrainedModel):
             )
         return logits, scale_ratio
 
-    def forward(self, idx, targets=None, attention_mask=None):
+    def forward(
+        self,
+        idx=None,
+        targets=None,
+        attention_mask=None,
+        *,
+        input_ids=None,
+        labels=None,
+    ):
+        if idx is not None and input_ids is not None:
+            raise ValueError("pass only one of idx or input_ids")
+        if targets is not None and labels is not None:
+            raise ValueError("pass only one of targets or labels")
+        if idx is None:
+            idx = input_ids
+        if targets is None:
+            targets = labels
+        if idx is None:
+            raise ValueError("idx or input_ids is required")
+
         if idx.dim() != 2:
             raise ValueError("idx must have shape [batch_size, seq_len]")
         if idx.dtype not in (torch.int32, torch.int64):
@@ -558,7 +580,6 @@ class Transformer(PreTrainedModel):
 
         x = self.norm(x)
 
-        self.OUT.pop("output_scale_ratio", None)
         output_x = x if targets is not None else x[:, [-1], :]
         diagnose_scale = (
             self.output_head_type == "hybrid"
@@ -570,9 +591,8 @@ class Transformer(PreTrainedModel):
             diagnose_scale=diagnose_scale,
         )
 
-        if targets is None:
-            self.last_loss = None
-        else:
+        last_loss = None
+        if targets is not None:
             batch_size, seq_len, vocab_size = logits.shape
             loss_targets = targets
             if attention_mask is not None:
@@ -581,17 +601,19 @@ class Transformer(PreTrainedModel):
                     -100,
                 )
 
-            self.last_loss = F.cross_entropy(
+            last_loss = F.cross_entropy(
                 logits.reshape(batch_size * seq_len, vocab_size),
                 loss_targets.reshape(batch_size * seq_len),
                 ignore_index=-100,
                 reduction="none",
             )
-        self.OUT["logits"] = logits
-        self.OUT["last_loss"] = self.last_loss
+        outputs = {
+            "logits": logits,
+            "last_loss": last_loss,
+        }
         if scale_ratio is not None:
-            self.OUT["output_scale_ratio"] = scale_ratio
-        return self.OUT
+            outputs["output_scale_ratio"] = scale_ratio
+        return outputs
 
     @torch.inference_mode()
     def generate(
