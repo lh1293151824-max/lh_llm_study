@@ -90,6 +90,7 @@ def build_args_from_config(stage=None, mode=None):
         save_every_epochs=active_config["SAVE_EVERY_EPOCHS"],
         val_ratio=default_config.VAL_RATIO,
         val_interval=default_config.VAL_INTERVAL,
+        val_top_k=default_config.VAL_TOP_K,
         resume=default_config.RESUME,
         resume_checkpoint_path=default_config.RESUME_CHECKPOINT_PATH,
         sft_init_checkpoint_path=active_config["SFT_INIT_CHECKPOINT_PATH"],
@@ -269,15 +270,39 @@ def split_train_val_dataset(dataset, val_ratio, seed, train_stage):
     return random_split(dataset, [train_size, val_size], generator=generator)
 
 
-def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
+def count_additional_output_head_parameters(model):
+    base_model = unwrap_model(model)
+    operator_output = base_model.operator_output
+    if operator_output is None:
+        return 0
+    return sum(
+        parameter.numel()
+        for parameter in operator_output.parameters()
+    )
+
+
+def evaluate_metrics(
+    model,
+    val_loader,
+    device,
+    args,
+    stage_label,
+    global_step,
+):
+    if args.train_stage != "pretrain":
+        raise ValueError("evaluate_metrics currently supports pretrain only")
     if val_loader is None:
         return None
+    if args.val_top_k <= 0:
+        raise ValueError("VAL_TOP_K must be greater than 0")
 
     was_training = model.training
     model.eval()
 
-    total_loss = 0.0
-    total_batches = 0
+    total_nll_sum = 0.0
+    total_valid_tokens = 0
+    total_top1_correct = 0
+    total_topk_correct = 0
     max_output_scale_ratio = None
 
     with torch.no_grad():
@@ -294,28 +319,65 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
 
             with autocast("cuda", enabled=args.use_amp and device.type == "cuda"):
                 outputs = model(x, labels, attention_mask=attention_mask)
-                token_loss = outputs["last_loss"].view(-1)
-                flat_loss_mask = loss_mask.view(-1)
-                if token_loss.numel() != flat_loss_mask.numel():
-                    raise RuntimeError(
-                        "gathered token loss size does not match loss mask size"
-                    )
-                scale_ratio = outputs.get("output_scale_ratio")
-                if scale_ratio is not None:
-                    ratio_value = scale_ratio.detach().max().item()
-                    max_output_scale_ratio = (
-                        ratio_value
-                        if max_output_scale_ratio is None
-                        else max(max_output_scale_ratio, ratio_value)
-                    )
-                valid_tokens = flat_loss_mask.sum()
-                if valid_tokens.item() == 0:
-                    continue
-                loss = torch.sum(token_loss * flat_loss_mask) / valid_tokens
 
-            total_loss += loss.item()
-            total_batches += 1
-            progress.set_postfix(val_loss=f"{loss.item():.6f}")
+            token_loss = outputs["last_loss"].reshape(-1)
+            flat_logits = outputs["logits"].reshape(
+                -1,
+                outputs["logits"].size(-1),
+            )
+            flat_labels = labels.reshape(-1)
+            flat_loss_mask = loss_mask.reshape(-1).bool()
+
+            expected_tokens = flat_loss_mask.numel()
+            if token_loss.numel() != expected_tokens:
+                raise RuntimeError(
+                    "gathered token loss size does not match loss mask size"
+                )
+            if flat_logits.size(0) != expected_tokens:
+                raise RuntimeError(
+                    "gathered logits size does not match loss mask size"
+                )
+            if flat_labels.numel() != expected_tokens:
+                raise RuntimeError(
+                    "labels size does not match loss mask size"
+                )
+
+            batch_valid_tokens = int(flat_loss_mask.sum().item())
+            if batch_valid_tokens == 0:
+                continue
+
+            active_loss = token_loss[flat_loss_mask]
+            active_logits = flat_logits[flat_loss_mask]
+            active_labels = flat_labels[flat_loss_mask]
+
+            total_nll_sum += active_loss.float().sum().item()
+            total_valid_tokens += batch_valid_tokens
+
+            top1_predictions = active_logits.argmax(dim=-1)
+            total_top1_correct += (
+                top1_predictions.eq(active_labels).sum().item()
+            )
+
+            top_k = min(args.val_top_k, active_logits.size(-1))
+            topk_predictions = active_logits.topk(top_k, dim=-1).indices
+            total_topk_correct += (
+                topk_predictions.eq(active_labels.unsqueeze(-1))
+                .any(dim=-1)
+                .sum()
+                .item()
+            )
+
+            scale_ratio = outputs.get("output_scale_ratio")
+            if scale_ratio is not None:
+                ratio_value = scale_ratio.detach().max().item()
+                max_output_scale_ratio = (
+                    ratio_value
+                    if max_output_scale_ratio is None
+                    else max(max_output_scale_ratio, ratio_value)
+                )
+
+            running_nll = total_nll_sum / total_valid_tokens
+            progress.set_postfix(val_nll=f"{running_nll:.6f}")
 
     if was_training:
         model.train()
@@ -335,9 +397,90 @@ def evaluate_loss(model, val_loader, device, args, stage_label, global_step):
             stacklevel=2,
         )
 
-    if total_batches == 0:
+    if total_valid_tokens == 0:
         return None
-    return total_loss / total_batches
+
+    val_nll = total_nll_sum / total_valid_tokens
+    try:
+        val_ppl = math.exp(val_nll)
+    except OverflowError:
+        val_ppl = float("inf")
+
+    return {
+        "nll": val_nll,
+        "ppl": val_ppl,
+        "masked_token_accuracy": (
+            total_top1_correct / total_valid_tokens
+        ),
+        "masked_topk_accuracy": (
+            total_topk_correct / total_valid_tokens
+        ),
+        "valid_tokens": total_valid_tokens,
+        "top_k": min(
+            args.val_top_k,
+            unwrap_model(model).config.vocab_size,
+        ),
+        "max_output_scale_ratio": max_output_scale_ratio,
+    }
+
+
+def write_validation_metrics(
+    writer,
+    metrics,
+    args,
+    global_step,
+    running_train_nll,
+):
+    if args.train_stage != "pretrain":
+        raise ValueError(
+            "write_validation_metrics currently supports pretrain only"
+        )
+
+    metric_prefix = f"pretrain/{args.output_head_type}"
+    writer.add_scalar(
+        f"{metric_prefix}/val_nll",
+        metrics["nll"],
+        global_step,
+    )
+    writer.add_scalar(
+        f"{metric_prefix}/val_ppl",
+        metrics["ppl"],
+        global_step,
+    )
+    writer.add_scalar(
+        f"{metric_prefix}/val_masked_token_accuracy",
+        metrics["masked_token_accuracy"],
+        global_step,
+    )
+    writer.add_scalar(
+        f"{metric_prefix}/val_masked_top{metrics['top_k']}_accuracy",
+        metrics["masked_topk_accuracy"],
+        global_step,
+    )
+    writer.add_scalar(
+        f"{metric_prefix}/val_minus_train_nll",
+        metrics["nll"] - running_train_nll,
+        global_step,
+    )
+
+
+def format_validation_message(
+    stage_label,
+    global_step,
+    metrics,
+    running_train_nll,
+):
+    return (
+        f"{stage_label} val | "
+        f"step={global_step} | "
+        f"val_nll={metrics['nll']:.6f} | "
+        f"val_ppl={metrics['ppl']:.6f} | "
+        f"token_acc={metrics['masked_token_accuracy']:.6f} | "
+        f"top{metrics['top_k']}_acc="
+        f"{metrics['masked_topk_accuracy']:.6f} | "
+        f"gap={metrics['nll'] - running_train_nll:.6f} | "
+        f"val_tokens={metrics['valid_tokens']}"
+    )
 
 
 def _checkpoint_model_config(model):
@@ -576,7 +719,7 @@ def init_model(args, tokenizer, device, log_file):
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=args.train_stage != "pretrain",
         pin_memory=torch.cuda.is_available(),
         num_workers=args.num_workers,
     )
@@ -614,6 +757,12 @@ def init_model(args, tokenizer, device, log_file):
     log_message(f"warmup_iters: {args.warmup_iters}", log_file)
     log_message(f"val_ratio: {args.val_ratio}", log_file)
     log_message(f"val_interval: {args.val_interval}", log_file)
+    log_message(f"val_top_k: {args.val_top_k}", log_file)
+    log_message(
+        "train_shuffle: "
+        f"{args.train_stage != 'pretrain'}",
+        log_file,
+    )
     log_message(f"use_amp: {args.use_amp}", log_file)
     log_message(f"output_head_type: {args.output_head_type}", log_file)
     log_message(f"operator_rank: {args.operator_rank}", log_file)
@@ -645,9 +794,17 @@ def init_model(args, tokenizer, device, log_file):
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+    additional_output_head_params = (
+        count_additional_output_head_parameters(model)
+    )
     log_message(f"total_params: {total_params / 1e9:.6f} B", log_file)
     log_message(
         f"trainable_params: {trainable_params / 1e9:.6f} B",
+        log_file,
+    )
+    log_message(
+        "additional_output_head_params: "
+        f"{additional_output_head_params}",
         log_file,
     )
 
@@ -751,10 +908,13 @@ def train(args):
         f"[{args.output_head_type}]"
         f"[{args.train_stage}]"
     )
+    metric_prefix = f"{args.train_stage}/{args.output_head_type}"
     last_step_checkpoint = global_step
 
     for epoch in range(start_epoch, args.epochs):
         total_loss = 0.0
+        epoch_nll_sum = 0.0
+        epoch_valid_tokens = 0
         valid_batch_count = 0
         accumulated_batches = 0
         current_epoch = epoch + 1
@@ -785,7 +945,10 @@ def train(args):
                 valid_tokens = flat_loss_mask.sum()
                 if valid_tokens.item() == 0:
                     continue
-                loss = torch.sum(token_loss * flat_loss_mask) / valid_tokens
+                masked_loss_sum = torch.sum(
+                    token_loss * flat_loss_mask
+                )
+                loss = masked_loss_sum / valid_tokens
 
             scaler.scale(loss).backward()
             accumulated_batches += 1
@@ -803,8 +966,20 @@ def train(args):
                 accumulated_batches = 0
 
             total_loss += loss.item()
+            if args.train_stage == "pretrain":
+                epoch_nll_sum += (
+                    masked_loss_sum.detach().float().item()
+                )
+                epoch_valid_tokens += int(valid_tokens.item())
+
             writer.add_scalar("train/batch_loss", loss.item(), global_step)
             writer.add_scalar("train/lr", lr, global_step)
+            if args.train_stage == "pretrain":
+                writer.add_scalar(
+                    f"{metric_prefix}/train_nll",
+                    loss.item(),
+                    global_step,
+                )
             global_step += 1
             pbar.set_postfix(
                 step=global_step,
@@ -827,7 +1002,7 @@ def train(args):
                 and val_loader is not None
                 and global_step % args.val_interval == 0
             ):
-                val_loss = evaluate_loss(
+                metrics = evaluate_metrics(
                     model=model,
                     val_loader=val_loader,
                     device=device,
@@ -835,12 +1010,27 @@ def train(args):
                     stage_label=stage_label,
                     global_step=global_step,
                 )
-                if val_loss is not None:
-                    writer.add_scalar("val/loss", val_loss, global_step)
-                    val_message = (
-                        f"{stage_label} val | "
-                        f"step={global_step} | "
-                        f"val_loss={val_loss:.6f}"
+                if metrics is not None:
+                    running_train_nll = (
+                        epoch_nll_sum / epoch_valid_tokens
+                    )
+                    write_validation_metrics(
+                        writer=writer,
+                        metrics=metrics,
+                        args=args,
+                        global_step=global_step,
+                        running_train_nll=running_train_nll,
+                    )
+                    writer.add_scalar(
+                        "val/loss",
+                        metrics["nll"],
+                        global_step,
+                    )
+                    val_message = format_validation_message(
+                        stage_label=stage_label,
+                        global_step=global_step,
+                        metrics=metrics,
+                        running_train_nll=running_train_nll,
                     )
                     tqdm.write(val_message)
                     log_message(val_message, log_file)
@@ -883,8 +1073,22 @@ def train(args):
                 "Check the dataset and loss masks."
             )
 
-        avg_loss = total_loss / valid_batch_count
+        if args.train_stage == "pretrain":
+            if epoch_valid_tokens == 0:
+                raise RuntimeError(
+                    "No valid pretraining tokens found in the epoch."
+                )
+            avg_loss = epoch_nll_sum / epoch_valid_tokens
+        else:
+            avg_loss = total_loss / valid_batch_count
+
         writer.add_scalar("train/epoch_avg_loss", avg_loss, current_epoch)
+        if args.train_stage == "pretrain":
+            writer.add_scalar(
+                f"{metric_prefix}/epoch_train_nll",
+                avg_loss,
+                current_epoch,
+            )
         epoch_message = (
             f"{stage_label} epoch={current_epoch}/{args.epochs} | "
             f"avg_loss={avg_loss:.6f}"

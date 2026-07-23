@@ -137,14 +137,31 @@ def get_start_stage():
     return cfg.TRAIN_STAGE
 
 
-def main():
+def get_selected_stages():
     start_stage = get_start_stage()
+    end_stage = cfg.PIPELINE_END_STAGE
     pipeline_stages = cfg.PIPELINE_STAGES
+
     if start_stage not in pipeline_stages:
         raise ValueError(f"TRAIN_STAGE must be one of {pipeline_stages}")
+    if end_stage not in {"pretrain", "sft"}:
+        raise ValueError(
+            'PIPELINE_END_STAGE must be "pretrain" or "sft"'
+        )
 
     start_index = pipeline_stages.index(start_stage)
-    selected_stages = pipeline_stages[start_index:]
+    end_index = pipeline_stages.index(end_stage)
+    if start_index > end_index:
+        raise ValueError(
+            "Pipeline start stage cannot be later than end stage: "
+            f"start={start_stage!r}, end={end_stage!r}"
+        )
+
+    return pipeline_stages[start_index : end_index + 1]
+
+
+def main():
+    selected_stages = get_selected_stages()
 
     if any(stage in PRETRAIN_DATA_STAGES for stage in selected_stages):
         ensure_pretrain_original_data(selected_stages)
@@ -152,7 +169,13 @@ def main():
     for stage in selected_stages:
         run_stage(stage)
 
-    print("训练完成，可以开始推理啦~")
+    if cfg.PIPELINE_END_STAGE == "pretrain":
+        print(
+            "Pretraining finished. PIPELINE_END_STAGE='pretrain', "
+            "so the SFT stage was not executed."
+        )
+    else:
+        print("训练完成，可以开始推理啦~")
 
 
 if __name__ == "__main__":

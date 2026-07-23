@@ -5,17 +5,24 @@
 # =============================================================================
 
 # Options: "train", "test"
-CONFIG_MODE = "train"
+CONFIG_MODE = "test"
 
 # Options: True, False
-# True: run build_pretrain_original_from_docs -> data_prep -> tokenizer
-#       -> tokenizer_eval -> pretrain -> sft.
-# False: start from TRAIN_STAGE and continue through the remaining pipeline stages.
+# True: start from build_pretrain_original_from_docs and continue through
+#       PIPELINE_END_STAGE.
+# False: start from TRAIN_STAGE and continue through PIPELINE_END_STAGE.
 RUN_FULL_PIPELINE = True
+
+# Options: "pretrain", "sft"
+# "pretrain": stop after pretraining and model export.
+# "sft": continue through the SFT stage.
+PIPELINE_END_STAGE = "pretrain"
 
 # Options: "linear", "deeponet", "hybrid"
 
-OUTPUT_HEAD_TYPE = "deeponet"
+OUTPUT_HEAD_TYPE = "linear"
+
+OPERATOR_RANK = 128
 #=====================================================
 
 # Options when RUN_FULL_PIPELINE is False:
@@ -37,7 +44,7 @@ TRAIN_STAGE = "sft"
 #
 # This switch is only used when the pipeline does NOT start from
 # build_pretrain_original_from_docs.
-PRETRAIN_ORIGINAL_SOURCE_WHEN_SKIP_DOCS = "happy"
+PRETRAIN_ORIGINAL_SOURCE_WHEN_SKIP_DOCS = "merged"
 
 
 # =============================================================================
@@ -99,11 +106,14 @@ SFT_TEST_LIMIT = 100
 # =============================================================================
 # Validation config
 # =============================================================================
-# Ratio of processed data used for validation during model training.
-VAL_RATIO = 0.05
+# Ratio of processed pretraining data used for validation.
+VAL_RATIO = 0.10
 
 # Run validation every N training steps. Set to 0 to disable step validation.
 VAL_INTERVAL = 100
+
+# Top-k used by masked validation token accuracy.
+VAL_TOP_K = 5
 
 
 # Processed training data.
@@ -168,7 +178,7 @@ SYSTEM_PROMPT = "你是一个AI助手"
 
 
 # Shared Branch/Trunk feature dimension used by the DeepONet output head.
-OPERATOR_RANK = 1024*4
+
 
 # DeepONet contribution in hybrid mode; Linear contribution is 1 - alpha.
 OPERATOR_ALPHA = 0.9
@@ -255,7 +265,7 @@ TEST_CONFIG = {
 # =============================================================================
 
 # Options: "pretrain", "sft"
-SAMPLE_STAGE = TRAIN_STAGE
+SAMPLE_STAGE = PIPELINE_END_STAGE
 
 # Empty checkpoint path: automatically use the latest checkpoint for SAMPLE_STAGE.
 SAMPLE_CHECKPOINT_PATH = ""
