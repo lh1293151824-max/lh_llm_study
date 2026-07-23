@@ -5,7 +5,7 @@
 # =============================================================================
 
 # Options: "train", "test"
-CONFIG_MODE = "test"
+CONFIG_MODE = "train"
 
 # Options: True, False
 # True: start from build_pretrain_original_from_docs and continue through
@@ -22,7 +22,7 @@ PIPELINE_END_STAGE = "pretrain"
 
 OUTPUT_HEAD_TYPE = "linear"
 
-OPERATOR_RANK = 128
+OPERATOR_RANK = 256
 #=====================================================
 
 # Options when RUN_FULL_PIPELINE is False:
