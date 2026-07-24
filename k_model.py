@@ -458,10 +458,9 @@ class Transformer(PreTrainedModel):
         if self.output_head_type in {"deeponet", "hybrid"}:
             self.operator_output = DeepONetOutputHead(
                 dim=self.dim,
+                vocab_size=self.vocab_size,
                 operator_rank=config.operator_rank,
-                norm_eps=self.norm_eps,
                 dropout=self.dropout,
-                norm_layer=RMSNorm,
             )
 
         self.apply(self._init_weights)
@@ -502,10 +501,7 @@ class Transformer(PreTrainedModel):
         if self.output_head_type == "linear":
             return self.output(x), None
 
-        operator_logits = self.operator_output(
-            x,
-            self.tok_embeddings.weight,
-        )
+        operator_logits = self.operator_output(x)
         if self.output_head_type == "deeponet":
             return operator_logits, None
 
